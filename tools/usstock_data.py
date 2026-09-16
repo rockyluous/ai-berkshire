@@ -84,10 +84,12 @@ _TAGS = {
     "marketable": ["MarketableSecuritiesCurrent", "AvailableForSaleSecuritiesDebtSecuritiesCurrent",
                    "ShortTermInvestments"],
     "lt_debt": ["LongTermDebtNoncurrent", "LongTermDebt"],
+    "st_debt": ["LongTermDebtCurrent", "DebtCurrent", "ShortTermBorrowings",
+                "LongTermDebtAndCapitalLeaseObligationsCurrent"],
     "buyback": ["PaymentsForRepurchaseOfCommonStock"],
     "dividends": ["PaymentsOfDividendsCommonStock", "PaymentsOfDividends"],
 }
-_INSTANT = {"equity", "assets", "cash", "marketable", "lt_debt"}
+_INSTANT = {"equity", "assets", "cash", "marketable", "lt_debt", "st_debt"}
 _PER_SHARE = {"eps_diluted"}
 _SHARE_COUNT = {"diluted_shares"}
 
@@ -547,6 +549,7 @@ def cmd_valuation(ticker, price=None, shares=None, as_json=False, cik=None):
     cash = _nearest_instant(_instants(_entries(facts, "cash")), last4[-1]["end"], 40)
     mkt = _nearest_instant(_instants(_entries(facts, "marketable")), last4[-1]["end"], 40)
     debt = _nearest_instant(_instants(_entries(facts, "lt_debt")), last4[-1]["end"], 40)
+    st_debt = _nearest_instant(_instants(_entries(facts, "st_debt")), last4[-1]["end"], 40) or 0
     mcap = price * sh if sh else None
     fcf = (ocf - capex) if (ocf is not None and capex is not None) else None
     # 核心 EPS：剔除非经营损益（按 TTM 有效税率近似税后）
@@ -565,7 +568,8 @@ def cmd_valuation(ticker, price=None, shares=None, as_json=False, cik=None):
         "ps_ttm": (mcap / rev) if (mcap and rev) else None,
         "pb": (mcap / eq) if (mcap and eq) else None,
         "fcf_yield": (fcf / mcap) if (fcf is not None and mcap) else None,
-        "net_cash": ((cash or 0) + (mkt or 0) - (debt or 0)) if cash is not None else None,
+        "net_cash": ((cash or 0) + (mkt or 0) - (debt or 0) - st_debt) if cash is not None else None,
+        "st_debt": st_debt, "lt_debt": debt,
     }
     if as_json:
         print(json.dumps(out, ensure_ascii=False, indent=2))
@@ -577,7 +581,8 @@ def cmd_valuation(ticker, price=None, shares=None, as_json=False, cik=None):
     if core_eps is not None and non and abs(non / (op or 1)) > 0.15:
         print(f"  PE(TTM, 核心估计) {_num(out['pe_core_est'])}x   ← 剔除非经营损益 {_yi(non)} 亿（按 21% 税率近似税后），核心EPS≈{_num(core_eps)}")
     print(f"  PS(TTM)  {_num(out['ps_ttm'])}x    PB  {_num(out['pb'])}x    FCF收益率  {_pct(out['fcf_yield'])}")
-    print(f"  净现金（现金+短期有价证券−长期债务）≈ {_yi(out['net_cash'])} 亿美元")
+    print(f"  净现金（现金+短期有价证券−长期债务 {_yi(debt)}−一年内到期债务 {_yi(st_debt)}）≈ {_yi(out['net_cash'])} 亿美元"
+          f"   ※ 未扣租赁负债与权益证券，SOTP 前须按报告口径再拆")
     w = _oneoff_warning(q)
     if w:
         print(f"\n  {w}")
@@ -730,6 +735,9 @@ def main():
         if cmd in ("quote", "valuation"):
             p.add_argument("--price", type=float, help="手动指定股价（行情接口被拦截时）")
             p.add_argument("--shares", type=float, help="手动指定总股本（股）")
+        else:
+            # financials / quarterly 不用股价，但允许传入并忽略——研究流程要求"所有子命令一律 --price 锁基准价"
+            p.add_argument("--price", type=float, help=argparse.SUPPRESS)
         if cmd == "financials":
             p.add_argument("--years", type=int, default=5)
         if cmd == "quarterly":
