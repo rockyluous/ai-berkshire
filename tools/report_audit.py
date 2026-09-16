@@ -64,6 +64,12 @@ _LABEL_RE = re.compile(
     r'\s*(?P<unit>亿[元美港]?元?|万亿|[xX倍]|%|[BMT])?'
 )
 
+# 标签命中即视为非数据点（评分、定性判断、操作建议里的价格/PE 阈值等）
+_NON_DATA_LABEL_RE = re.compile(
+    r'评分|评级|判断|阈值|建议|操作|情景|信号|催化|激进型|稳健型|保守型|Checklist|通过\?'
+    r'|区间|中位|隐含|目标价|涨跌幅|vs 现价|负面项|正面项|更新日期'   # 工具派生值 / 摘要句，不是外部可核验数据
+)
+
 _TABLE_ROW_RE = re.compile(
     r'\|\s*(?P<label>[^|]{1,40})\s*\|\s*[~约]?\$?(?P<num>' + _SIGN + r'[\d,，\.]+)'
     r'\s*(?P<unit>亿[元美港]?元?|万亿|[xX倍]|%|[BMT])?\s*\|'
@@ -169,6 +175,20 @@ def _parse_md_tables(lines: list) -> list:
     return results
 
 
+_COUNT_WORD_RE = re.compile(r'([\d,，]+(?:\.\d+)?)\s*(?:位|人|家|个|次|份|篇|颗|辆|城|款|条|年|季|月|日|天|周|小时)')
+
+
+def _looks_like_year_or_count(val, unit: str, raw: str) -> bool:
+    """无单位的 1900–2100 整数当年份；"54 位分析师""3,067 辆"这类计数不是财务数据点。"""
+    if unit == '' and float(val).is_integer() and 1900 <= val <= 2100:
+        return True
+    for m in _COUNT_WORD_RE.finditer(raw):
+        n = _clean_num(m.group(1))
+        if n is not None and abs(n - val) < 1e-9:
+            return True
+    return False
+
+
 def extract_data_points(md_text: str) -> list:
     """从 Markdown 报告中提取所有可识别的财务数据点。
 
@@ -186,6 +206,9 @@ def extract_data_points(md_text: str) -> list:
     def _add(label, val, unit, lineno, raw):
         label = re.sub(r'[\*_`]+', '', label).strip()
         if not _is_valid_label(label):
+            return
+        # 评分 / 判断 / 建议阈值不是可外部核验的数据点，抽进样本只会制造假"通过"
+        if '★' in raw or _NON_DATA_LABEL_RE.search(label):
             return
         if val is None or val == 0 or abs(val) > 1e15:
             return
@@ -216,6 +239,11 @@ def extract_data_points(md_text: str) -> list:
         # 跳过无意义列标题（YoY增速列单独标注，不作为待核验数据）
         if col_header.upper() in ('YOY', 'YOY增速', '增速', '同比', '变化', '趋势', '说明', '备注'):
             continue
+        # "来源 / 说明""口径""角色""期末"这类列装的是注释，不是待核验数据
+        if any(k in col_header for k in ('来源', '说明', '备注', '口径', '角色', '期末', '日期', '更新', '同业', '对比', '可比', '对照')):
+            continue
+        if _looks_like_year_or_count(val, unit, raw):
+            continue
         # label = "行标签 · 列标题"（若列标题是行标签的补充）
         if col_header and col_header != row_label:
             label = f"{row_label} · {col_header}"
@@ -238,6 +266,8 @@ def extract_data_points(md_text: str) -> list:
             label = m.group('label')
             val = _clean_num(m.group('num'))
             unit = (m.group('unit') or '').strip()
+            if val is not None and _looks_like_year_or_count(val, unit, stripped):
+                continue
             _add(label, val, unit, lineno, stripped)
 
     return points
@@ -416,6 +446,246 @@ def render_verdict(results: list, report_name: str = "") -> dict:
 
 
 # ---------------------------------------------------------------------------
+# 一致性检查：多份底稿之间的关键事实是否打架
+# ---------------------------------------------------------------------------
+
+# 单位 → 亿 的换算系数（货币类）
+_UNIT_TO_YI = {'亿': 1.0, '万亿': 10000.0, 'B': 10.0, 'T': 10000.0, 'M': 0.01, '': 1.0}
+
+_NUM = r'([\d,，]+(?:\.\d+)?)'
+_RANGE_SEP = r'\s*[-–~—至]\s*'
+
+# 关键字段：名称 → (正则, 是否区间, 容差)
+# 正则需捕获 1 个数（或区间 2 个数）+ 可选单位组；默认容差 1%
+_KEY_FIELDS = [
+    ('资本开支指引',
+     r'(?:资本开支|Capex|capex|CapEx|资本支出)[^\n|]{0,40}?指引[^\n|]{0,40}?\$?\s*' + _NUM + _RANGE_SEP + r'\$?\s*' + _NUM + r'\s*(万亿|亿|B|T)',
+     True, 0.01),
+    # 现价：排除"目标/隐含/情景"股价，排除后接货币单位（那是市值）和"左右/分歧"（那是价差描述）
+    ('股价',
+     r'(?<!目标)(?<!隐含)(?<!情景)(?<!转)(?<!触发)(?<!上限)(?<!下限)股价(?![^\d\n]{0,25}(?:目标|分歧|价差|、))[^\d\n]{0,25}\$\s*' + _NUM + r'()(?![\d\.])(?![,，]\d)(?!\s*[万亿BT])(?!\s*左右)',
+     False, 0.02),
+    ('总股本',
+     r'总股本(?![^\d\n]{0,20}、)[^\d\n]{0,20}' + _NUM + r'\s*(亿|B)',
+     False, 0.01),
+    # 市值：排除"蒸发/缩水/增减"等变动量描述
+    ('市值',
+     r'(?<!回购)(?<!回购总)(?<!回购的)市值(?![^\d\n]{0,20}(?:蒸发|缩水|损失|增|减|变|、))[^\d\n]{0,20}\$?\s*' + _NUM + r'\s*(万亿|亿|T|B)',
+     False, 0.02),
+    # 净现金：排除"剔除/扣除净现金后"的算式行
+    ('净现金',
+     r'(?<!剔除)(?<!扣除)(?<!减去)(?<!金融)(?<!真实)(?<!真实的)净现金(?![^\d\n]{0,20}(?:[、，,]|金融|拆))[^\d\n]{0,20}\$?\s*' + _NUM + r'\s*(万亿|亿|T|B)',
+     False, 0.01),
+]
+
+# 同一行既提旧指引又提新指引（上调/下调/原为…）时，只取该行最后一个区间
+_REVISION_HINT_RE = re.compile(r'上调|下调|上修|下修|调高|调低|原为|原指引|旧指引|更新前|此前')
+# 复核记录 / 勘误类的元描述行，本身就在罗列错误值，整行不计
+_META_LINE_RE = re.compile(r'复核|订正|勘误|各不相同|误写|误引|原稿')
+_GENERIC_RANGE_RE = re.compile(r'\$?\s*' + _NUM + _RANGE_SEP + r'\$?\s*' + _NUM + r'\s*(万亿|亿|B|T)')
+
+
+_OLD_BEFORE_RE = re.compile(r'(?:原|旧|由|从|年初|此前|更新前)[^\d$]{0,6}$')
+_OLD_AFTER_RE = re.compile(r'^\s*(?:两次|再次|多次|再度)?\s*(?:上调|下调|上修|下修|调高|调低|调整|修正)')
+
+
+def _looks_old(line: str, m) -> bool:
+    """修订语境里，判断某个区间是否是被替换掉的旧值。"""
+    before = line[max(0, m.start() - 10):m.start()]
+    after = line[m.end():m.end() + 8]
+    return bool(_OLD_BEFORE_RE.search(before) or _OLD_AFTER_RE.search(after))
+
+
+_CELL_NUM_RE = re.compile(r'\$?\s*[\d,，]+(?:\.\d+)?\s*(?:万亿|亿|[BMT]|%|x)?')
+
+
+def _is_peer_table_row(line: str) -> bool:
+    """表格行且行标签之后有 ≥3 个数值单元格 → 视为多公司/多期横评，不做单值一致性比对。"""
+    st = line.strip()
+    if not st.startswith('|'):
+        return False
+    cells = [c.strip() for c in st.strip('|').split('|')]
+    if len(cells) < 4:
+        return False
+    numeric = sum(1 for c in cells[1:] if c and _CELL_NUM_RE.fullmatch(c.strip('*_~ ')))
+    return numeric >= 3
+
+
+def _to_yi(num_str: str, unit: str) -> float:
+    v = _clean_num(num_str)
+    if v is None:
+        return None
+    return v * _UNIT_TO_YI.get(unit or '', 1.0)
+
+
+def collect_key_facts(files: list, fields=None) -> dict:
+    """返回 {字段名: [ {file, line, raw, value, display} ... ]}。"""
+    fields = fields or _KEY_FIELDS
+    out = {name: [] for name, *_ in fields}
+    for path in files:
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                lines = f.read().split('\n')
+        except OSError:
+            continue
+        in_code = False
+        for lineno, line in enumerate(lines, start=1):
+            if line.strip().startswith('```'):
+                in_code = not in_code
+                continue
+            if in_code or _META_LINE_RE.search(line):
+                continue          # 工具原始输出块 / 勘误行不计
+            if _is_peer_table_row(line):
+                continue          # 横评表：一行里是多家公司的数，不是本公司的
+            for name, pat, is_range, _tol in fields:
+                matches = list(re.finditer(pat, line))
+                if name == '市值':
+                    # "回购 X 亿股按现价计市值 …" 不是公司市值：看匹配点前 14 字
+                    matches = [m for m in matches
+                               if not re.search(r'回购|按现价|持仓|浮盈', line[max(0, m.start() - 14):m.start()])]
+                if is_range and matches and _REVISION_HINT_RE.search(line):
+                    # 该行在描述修订：字段命中即可，从行内所有区间里挑出"现行值"——
+                    # 排除被 原/旧/由/从/年初 修饰、或紧跟"上调/下调"的旧值
+                    generic = list(_GENERIC_RANGE_RE.finditer(line))
+                    current = [m for m in generic if not _looks_old(line, m)]
+                    if current:
+                        matches = current[-1:]
+                    elif generic:
+                        matches = generic[-1:]
+                for m in matches:
+                    g = m.groups()
+                    if is_range:
+                        lo, hi, unit = _to_yi(g[0], g[2]), _to_yi(g[1], g[2]), g[2] or ''
+                        if lo is None or hi is None:
+                            continue
+                        value = (lo + hi) / 2
+                        display = f'{g[0]}–{g[1]}{unit}'
+                    else:
+                        unit = g[1] if len(g) > 1 and g[1] else ''
+                        value = _to_yi(g[0], unit) if unit != '%' else _clean_num(g[0])
+                        if value is None:
+                            continue
+                        display = f'{g[0]}{unit}'
+                    out[name].append({
+                        'file': os.path.basename(path), 'line': lineno,
+                        'raw': line.strip()[:100], 'value': value, 'display': display,
+                    })
+    return out
+
+
+def render_consistency(facts: dict, fields=None) -> dict:
+    """打印各字段跨文件对照，返回 {'conflicts': [...], 'checked': n}。"""
+    fields = fields or _KEY_FIELDS
+    tol_by_name = {name: tol for name, _p, _r, tol in fields}
+    BOLD, RED, GREEN, YELLOW, RESET = '\033[1m', '\033[91m', '\033[92m', '\033[93m', '\033[0m'
+
+    print('=' * 70)
+    print(f'{BOLD}底稿一致性检查 — 关键事实跨文件对照{RESET}')
+    print('=' * 70)
+    conflicts = []
+    checked = 0
+    for name, hits in facts.items():
+        if not hits:
+            continue
+        checked += 1
+        vals = [h['value'] for h in hits]
+        lo, hi = min(vals), max(vals)
+        spread = (hi - lo) / abs(lo) if lo else (0.0 if hi == 0 else float('inf'))
+        tol = tol_by_name.get(name, 0.01)
+        files_involved = sorted({h['file'] for h in hits})
+        if spread <= tol:
+            print(f'  {GREEN}✅{RESET} {name:<8s} 一致（{len(hits)} 处，{len(files_involved)} 个文件）：{hits[0]["display"]}')
+            continue
+        print(f'  {RED}❌{RESET} {name:<8s} 冲突（跨度 {spread*100:.1f}% > 容差 {tol*100:.0f}%）')
+        for h in sorted(hits, key=lambda x: (x['file'], x['line'])):
+            print(f'       {h["file"]}:{h["line"]:<4d} {h["display"]:<22s} | {h["raw"][:70]}')
+        conflicts.append({'field': name, 'spread_pct': round(spread * 100, 2), 'hits': hits})
+    print('-' * 70)
+    if not conflicts:
+        print(f'{BOLD}{GREEN}【一致】{checked} 个关键字段跨文件无冲突。{RESET}')
+    else:
+        print(f'{BOLD}{RED}【冲突】{len(conflicts)} 个关键字段在不同文件里数值不一致，汇总前先统一底稿。{RESET}')
+    print('=' * 70)
+    return {'conflicts': conflicts, 'checked': checked}
+
+
+# ---------------------------------------------------------------------------
+# Lint：格式与纪律检查（对应 CLAUDE.md 的报告规范）
+# ---------------------------------------------------------------------------
+
+_LINT_RULES = [
+    # (代码, 级别, 说明, 检查函数(line) -> bool)
+    ('HALF-STAR', 'FAIL', '评分出现半星（CLAUDE.md：★1-5 不含半星）',
+     lambda l: re.search(r'\d\.5\s*/\s*5|½|★+\s*\.5', l) is not None),
+    ('STAR-COUNT', 'WARN', '星级写法异常（含☆时须凑满5个；★不得超过5个）',
+     lambda l: any(len(t) > 5 or ('☆' in t and len(t) != 5) for t in re.findall(r'[★☆]{2,}', l))),
+    ('SUBJECTIVE', 'FAIL', '主观表述（我认为/我觉得/显然）',
+     lambda l: (not l.lstrip().startswith('>')) and re.search(r'我认为|我觉得|显然', l) is not None),
+    ('GUIDANCE-NO-DATE', 'WARN', '指引类数字未标注日期/来源事件',
+     lambda l: ('指引' in l and re.search(r'\d', l) is not None
+                and re.search(r'20\d\d|截至|财报|电话会|上调|下调', l) is None)),
+    ('UNIT-SLIP', 'WARN', '同一行两个"亿"数值呈 10× / 100× 关系，疑似单位错位',
+     lambda l: _unit_slip(l)),
+]
+
+
+def _unit_slip(line: str) -> bool:
+    nums = [_clean_num(x) for x in re.findall(r'\$\s*([\d,，]+(?:\.\d+)?)\s*亿', line)]
+    nums = [n for n in nums if n]
+    for i in range(len(nums)):
+        for j in range(i + 1, len(nums)):
+            a, b = sorted((abs(nums[i]), abs(nums[j])))
+            if a and any(abs(b / a - k) / k < 0.005 for k in (10, 100)):
+                return True
+    return False
+
+
+def lint_files(files: list) -> dict:
+    BOLD, RED, YELLOW, GREEN, RESET = '\033[1m', '\033[91m', '\033[93m', '\033[92m', '\033[0m'
+    print('=' * 70)
+    print(f'{BOLD}报告 lint — 格式与纪律{RESET}')
+    print('=' * 70)
+    fails, warns = [], []
+    for path in files:
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                lines = f.read().split('\n')
+        except OSError:
+            print(f'  ⬜ 无法读取：{path}')
+            continue
+        in_code = False
+        for lineno, line in enumerate(lines, start=1):
+            if line.strip().startswith('```'):
+                in_code = not in_code
+                continue
+            if in_code:
+                continue
+            for code, level, desc, check in _LINT_RULES:
+                try:
+                    hit = check(line)
+                except Exception:
+                    hit = False
+                if hit:
+                    item = {'file': os.path.basename(path), 'line': lineno, 'code': code,
+                            'desc': desc, 'raw': line.strip()[:90]}
+                    (fails if level == 'FAIL' else warns).append(item)
+    for it in fails:
+        print(f'  {RED}❌ {it["code"]:<16s}{RESET} {it["file"]}:{it["line"]}  {it["desc"]}')
+        print(f'       {it["raw"]}')
+    for it in warns:
+        print(f'  {YELLOW}⚠️  {it["code"]:<16s}{RESET} {it["file"]}:{it["line"]}  {it["desc"]}')
+        print(f'       {it["raw"]}')
+    print('-' * 70)
+    print(f'  文件: {len(files)}  |  不通过: {RED}{len(fails)}{RESET}  |  警告: {YELLOW}{len(warns)}{RESET}')
+    if fails:
+        print(f'{BOLD}{RED}【打回】修正上述 FAIL 项后再汇总。{RESET}')
+    else:
+        print(f'{BOLD}{GREEN}【通过】无 FAIL 项。{RESET}' + ('  警告项请人工过目。' if warns else ''))
+    print('=' * 70)
+    return {'fails': fails, 'warns': warns}
+
+
+# ---------------------------------------------------------------------------
 # CLI Entry Point
 # ---------------------------------------------------------------------------
 
@@ -460,6 +730,12 @@ def main():
 
   固定随机种子（复现同一批样本）：
     python3 tools/report_audit.py extract --report reports/xxx.md --seed 42
+
+  多份底稿一致性检查（team-lead 汇总前必跑；指引/股价/股本/市值/净现金…跨文件对照）：
+    python3 tools/report_audit.py consistency --dir reports/腾讯
+
+  格式与纪律 lint（半星评分 / 主观表述 / 无日期指引 / 疑似单位错位）：
+    python3 tools/report_audit.py lint reports/腾讯/0*.md
         """)
 
     sub = parser.add_subparsers(dest='command')
@@ -477,9 +753,44 @@ def main():
     vrd.add_argument('--report', default='', help='报告名称（可选，用于显示）')
     vrd.add_argument('--output-json', action='store_true', help='将判决结果以 JSON 输出到 stdout')
 
+    # consistency
+    con = sub.add_parser('consistency', help='多份底稿之间的关键事实一致性检查')
+    con.add_argument('--dir', help='目录：检查其中所有 0*.md / 最终报告.md')
+    con.add_argument('files', nargs='*', help='或直接列出文件')
+    con.add_argument('--output-json', action='store_true')
+
+    # lint
+    lnt = sub.add_parser('lint', help='格式与纪律 lint（半星/主观表述/无日期指引/单位错位）')
+    lnt.add_argument('files', nargs='+', help='报告文件（可多个）')
+    lnt.add_argument('--output-json', action='store_true')
+
     args = parser.parse_args()
 
-    if args.command == 'extract':
+    if args.command == 'consistency':
+        files = list(args.files or [])
+        if args.dir:
+            import glob
+            files += sorted(glob.glob(os.path.join(args.dir, '0*.md')))
+            final = os.path.join(args.dir, '最终报告.md')
+            if os.path.exists(final):
+                files.append(final)
+        files = [f for f in files if os.path.exists(f)]
+        if not files:
+            print('❌ 没有可检查的文件', file=sys.stderr)
+            sys.exit(1)
+        facts = collect_key_facts(files)
+        outcome = render_consistency(facts)
+        if args.output_json:
+            print(json.dumps(outcome, ensure_ascii=False, indent=2))
+        sys.exit(1 if outcome['conflicts'] else 0)
+
+    elif args.command == 'lint':
+        outcome = lint_files(args.files)
+        if args.output_json:
+            print(json.dumps(outcome, ensure_ascii=False, indent=2))
+        sys.exit(1 if outcome['fails'] else 0)
+
+    elif args.command == 'extract':
         if not os.path.exists(args.report):
             print(f'❌ 文件不存在: {args.report}', file=sys.stderr)
             sys.exit(1)

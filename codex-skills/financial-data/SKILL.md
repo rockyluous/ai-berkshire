@@ -29,6 +29,24 @@ This skill is generated from `skills/financial-data.md` so Claude Code and Codex
 | 2（副） | **stockanalysis** | stockanalysis.com/stocks/{ticker}/financials | 直接访问，无需注册 |
 | 原始一手 | SEC EDGAR | sec.gov/cgi-bin/browse-edgar | 10-K / 10-Q 原文 |
 
+**美股取数工具**（分析美股时优先调用；财务数据直接来自 SEC XBRL 一手，输出自带非经营损益预警）：
+
+```bash
+python3 tools/usstock_data.py quote GOOGL --cik 1652044       # 最新价 + 股本 + 市值验算
+python3 tools/usstock_data.py financials GOOGL --cik 1652044  # 近5财年：营收/经营利润/净利/非经营损益/OCF/Capex/FCF/EPS/ROE
+python3 tools/usstock_data.py quarterly GOOGL --cik 1652044   # 近8季（现金流 YTD 已差分成单季，Q4 由年度−9M 推算并标 *）
+python3 tools/usstock_data.py valuation GOOGL --cik 1652044   # PE(TTM)/PB/PS/FCF收益率/净现金 + 核心PE估计
+python3 tools/usstock_data.py search alphabet                 # 查 CIK（需声明式 UA，见下）
+任何子命令加 --json → 机器可读，供数据底稿直接引用
+```
+
+美股特别注意：
+
+1. SEC 要求自动化访问声明 User-Agent（"名称 邮箱"）。未声明时财务数据端点仍可用，但 ticker→CIK 代码表会 403——直接用 `--cik`（CIK 在任何 10-K/8-K 网址里）。要用 `search`，设 `SEC_USER_AGENT` 或写 `local/sec_user_agent.txt`（不入库）
+2. 工具会在近 4 季非经营损益占经营利润 >15% 时报警——此时 GAAP PE 无意义，用工具给出的核心 PE 估计或自行剔除后再算
+3. 交叉验证：工具值（一手）与 stockanalysis 对照；macrotrends 对自动化访问经常 403，不再作为必需来源
+4. 多类别股票（GOOGL/GOOG、BRK）的封面页股数 XBRL 不给，工具退回最新季度稀释加权平均股数并注明；做市值验算时按公司 IR 披露的三类合计再核一次
+
 ### 港股（腾讯0700、网易9999、美团3690等）
 
 | 优先级 | 来源 | URL | 获取方式 |
@@ -72,6 +90,21 @@ python3 tools/twstock_data.py search 台積        # 搜索股票代码（注意
 5. 交叉验证：FinMind 数值与 Goodinfo（或 macrotrends 上的 ADR，如 TSM）对照，误差规则同下；台积电等有 ADR 的公司注意 ADR 与台股原股的汇率/存托比率差异（1 TSM ADR = 5 股 2330）
 
 ---
+
+## 叙述类断言的信源分级
+
+数字之外的事实（判决内容、管理层言论、产品数据、行业份额）同样要分级，报告中引用时按级别标注：
+
+| 级别 | 来源 | 用法 |
+|---|---|---|
+| 一手 | SEC/HKEX/巨潮 文件、公司 IR 新闻稿与电话会记录、法院文书、监管公告 | 可单独作为证据 |
+| 二级·主流 | Bloomberg / Reuters / WSJ / FT / CNBC / 财新 等 | 可作为证据，关键断言需与一手互证 |
+| 三级·机构 | StatCounter / Similarweb / Synergy / eMarketer / Counterpoint / Pew 等 | 引用时**必须写口径**（统计范围、时间窗、样本） |
+| 四级·聚合 | 个人博客、内容农场、加密/理财资讯站、自媒体转述 | **只能作线索**，不得作为唯一证据；引用须标注"单一低级别来源" |
+
+**美股主源不可用时的兜底**：macrotrends 对自动化访问经常返回 HTTP 403。此时不要静默退化成单源，改用 SEC EDGAR 一手文件（8-K Exhibit 99.1 财报新闻稿为 HTML，可直接抓取；XBRL companyfacts API：`https://data.sec.gov/api/xbrl/companyfacts/CIK{10位CIK}.json` 提供结构化历史数据）与 stockanalysis 互证，并在报告的数据来源表里注明"macrotrends 不可用，已换用 SEC 一手"。
+
+**指引类数据必须带日期**：资本开支、收入、利润率指引写法为「$X–Y（YYYY-MM-DD，QN 财报电话会；原为 $A–B）」。只保留最新一次，旧值放括号。多个 Agent 并行研究时，指引只允许在共享数据底稿里查一次。
 
 ## 执行规范
 

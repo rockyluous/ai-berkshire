@@ -61,6 +61,30 @@ This skill is generated from `skills/investment-team.md` so Claude Code and Code
    > ⚠️ 检测到 WebSearch 未在权限白名单中。后台研究 Agent 无法联网，会退化成仅凭训练知识作答。请先在 `.claude/settings.local.json` 的 `permissions.allow` 加入 `"WebSearch"`（或运行 `/permissions` 勾选），再重跑本命令。
 3. 命中 → 正常继续。
 
+### 第一步⅞：共享数据底稿（关键 · 消灭"四份报告四个数"）
+
+在启动四个视角 Agent **之前**，先产出一份所有人共用的事实表：`reports/{公司名}/00-数据底稿.md`。
+
+**为什么必须先做底稿**：四个 Agent 各自联网搜同一批基础事实（最新季报数字、资本开支指引、股价股本、判决日期），必然搜到不同日期的文章，产出互相打架的数字——实测一次研究中同一个 Capex 指引出现过三个版本，其中一个不对应任何真实指引。基础事实只允许被查一次、被引四次。
+
+**谁来做**：team-lead 亲自做，或派一个 `data-clerk` Agent **前置串行**完成（不要和四个视角 Agent 并行）。
+
+**底稿必含内容**（每一项都带 `截至日期` 和 `来源`，指引类必须写明"来自哪次财报/电话会、发布日期"）：
+
+| 区块 | 内容 | 一手来源 |
+|---|---|---|
+| 行情 | 股价（注明日期与股份类别）、总股本、市值验算（`financial_rigor.py verify-market-cap`） | 美股：`tools/usstock_data.py quote`；其余：交易所/公司IR + stockanalysis。**底稿定下的股价即全队基准价**，之后任何工具调用（`valuation`、`forward-range`、`three-scenario`）一律传 `--price {基准价}`，禁止再实时拉价——实测两个视角各自拉价会漂移 1% 并触发一致性冲突 |
+| 最新季报 | 营收、经营利润、GAAP 净利润、**一次性/非经常项目及其金额**、OCF、Capex、FCF、各分部收入与经营利润 | 美股：`tools/usstock_data.py quarterly --json`（分部数据另看 8-K Exhibit 99.1）；港股/A股：交易所公告 / 巨潮 |
+| 近 8 季 | 上述核心科目的季度序列 | 10-Q/10-K 或同等文件 |
+| 指引 | 资本开支、收入/利润指引——**只保留最新一次**，旧指引用括号注明"原为…，YYYY-MM-DD 上调/下调" | 财报电话会、新闻稿 |
+| 关键日期 | 诉讼判决、上诉排期、监管处罚、重大融资/回购/并购 | 法院文书、公司公告 |
+| 口径警示 | 会计估计变更（折旧年限等）、汇率、股份类别、ADR 比率 | 10-K 附注 |
+
+**四个视角 Agent 的引用纪律**（写进每个 Agent 的 prompt）：
+1. 基础数据**只准引底稿**，不得自行联网重查；联网只用于各自领域的增量信息（行业份额、竞品动态、管理层言论、判决细节等）
+2. 若联网发现与底稿冲突的数据，**在报告中标注冲突并上报 team-lead**，不得私自改数
+3. 指引、预期类数字必须连同底稿中的日期与来源一起引用
+
 ### 第二步：创建团队
 
 使用 TeamCreate 创建团队：
@@ -142,20 +166,26 @@ This skill is generated from `skills/investment-team.md` so Claude Code and Code
 {任务description的内容}
 
 **研究方法**：
-- 使用 WebSearch 搜索最新公开信息（财报、行业报告、新闻）
+- **基础数据只准引 `reports/{公司名}/00-数据底稿.md`**（股价/股本/季报数字/指引/关键日期），不得自行联网重查；联网只用于你所负责领域的增量信息。发现与底稿冲突的数据，在报告中标注冲突并告知 team-lead，不得私改
+- 调用任何取数/估值工具时**必须传 `--price {底稿基准价}`**（`usstock_data.py valuation`、`financial_rigor.py forward-range/three-scenario`），不许工具自动拉实时价
+- 使用 WebSearch 搜索你领域内的最新公开信息（行业报告、竞品动态、管理层言论、判决文书）
+- **叙述类断言的信源分级**（数字之外的事实同样要分级）：一手（SEC/公司IR/法院文书/监管公告）> 主流财经媒体（Bloomberg/Reuters/WSJ/FT/CNBC）> 行业研究机构（StatCounter/Synergy/eMarketer 等，注明口径）> 聚合博客与自媒体（**只能作线索，不得作为唯一证据**，引用时必须标注"单一低级别来源"）
+- **优先调用项目自有工具，禁止心算**：`tools/financial_rigor.py`（市值/估值验算、交叉验证、三情景、`forward-range` 前瞻价值区间）、`tools/terminal_value.py`（终值与反向折现——财务 Agent 必须用它回答"当前股价隐含了多少年、多高的增长"）、`tools/usstock_data.py`（美股 SEC 一手取数）、`tools/twstock_data.py`（台股取数）
 - **财务数据必须来自两个独立来源**，按 `skills/financial-data.md` 规范执行（美股：macrotrends+stockanalysis；港股：aastocks+macrotrends；A股：东方财富+巨潮资讯；台股：FinMind `tools/twstock_data.py`+Goodinfo），两源误差>1%须标记
 - 确保数据准确，关键数据标注来源
 - 分析要深入，不流于表面
 - **联网失败禁止伪装**：若 WebSearch 被拦截/不可用，禁止用训练知识冒充联网结果。必须在报告顶部醒目标注「⚠️ 本报告未能联网，基于训练知识（截止日期 X），置信度降级」，并如实告知 team-lead，由其决定是否中止研究
 
 **输出要求**：
+- 将完整报告写入 `reports/{公司名}/0{N}-{维度}-{大师}视角.md`（UTF-8，首行 `# 标题`），文件名见 CLAUDE.md
 - 报告要详尽，使用Markdown表格呈现关键数据
-- 每个分析维度要有明确结论和评分
+- 每个分析维度要有明确结论和评分；**评分只用整数星（★1-5），禁止 3.5/5 这类半星**
+- **货币单位统一用"亿"**（亿美元/亿港元/亿人民币），不要在同一份报告里混用 B/M 与亿；引用 $XXB 数据时换算成亿并保留原值
 - 报告末尾要有该维度的总体结论
 
 **完成后**：
 1. 使用 TaskUpdate 将任务 #{任务编号} 标记为 completed
-2. 通过 SendMessage 把完整分析报告发送给 team-lead（type: "message", recipient: "team-lead"）
+2. 通过 SendMessage 向 team-lead 发送 **5 条以内的核心要点摘要**（type: "message", recipient: "team-lead"）——完整报告已在文件里，不要在消息里重复整篇
 ```
 
 ### 第五步：接收报告并跟踪进度
@@ -167,6 +197,18 @@ This skill is generated from `skills/investment-team.md` so Claude Code and Code
 ### 第六步：关闭团队成员
 
 全部报告收到后，向4个Agent发送 shutdown_request（使用 SendMessage，type: "shutdown_request"）。
+
+### 第六步半：机器复核（汇总前必跑）
+
+```bash
+# 四份底稿之间的关键数据是否打架（指引 / 股价 / 股本 / 市值 / 净利润 / 一次性项目 …）
+python3 tools/report_audit.py consistency --dir reports/{公司名}
+
+# 格式与纪律 lint：半星评分、主观表述、无日期的指引、疑似单位错位
+python3 tools/report_audit.py lint reports/{公司名}/0*.md
+```
+
+两条命令任一报错，先修底稿再汇总。team-lead 在最终报告末尾附「复核记录」表：改了什么、依据什么。
 
 ### 第七步：汇总最终报告
 
@@ -182,6 +224,8 @@ This skill is generated from `skills/investment-team.md` so Claude Code and Code
 |------|------|------------|----------|
 
 综合评分：X / 5
+
+> **聚合规则**：四维算术均值取整数星。均值恰为 .5 时，若"财务估值"或"风险管理层"任一维度 ≤ ★3，则**向下取整**（估值与确定性是买入决策的约束项，不能被业务质量平均掉）；否则向上取整。在报告中写明取整依据。
 
 #### 3. 核心数据速览
 关键财务和经营指标表格（近2年对比）
@@ -202,6 +246,23 @@ This skill is generated from `skills/investment-team.md` so Claude Code and Code
 - 分层操作建议表（激进型/稳健型/保守型 → 建议+价格区间）
 - 关键催化剂（加仓信号/减仓信号各3-5条）
 
+#### 7½. 前瞻价值区间与更新记录
+
+用 `python3 tools/financial_rigor.py forward-range --price {现价} --eps FY{N}:{EPS} FY{N+1}:{EPS} FY{N+2}:{EPS} --pe {低} {高} --pe-mid {中位} --eps-basis "{口径}" --as-of {基准日}` 生成：
+
+| 财年 | 预期 EPS | EPS 口径与来源（含分析师数、是否单源） | 价值区间 | 中位价 | 中位 vs 现价 | 现价隐含 PE |
+|---|---|---|---|---|---|---|
+
+三个财年各有角色，表中要写明：**今年 = 校验**（现价是否被今年盈利支撑）、**明年 = 交易中**（市场按 NTM 盈利定价，下半年起主要看明年）、**后年 = 预计**（明年市场会滚动到它）。另给一行 NTM 混合 EPS（按剩余月份加权今年与明年）与现价隐含 NTM PE，这是"市场现在到底在按几倍交易"的唯一正确口径。
+
+硬规则：
+- **EPS 必须是剔除一次性损益的口径**。卖方一致预期若包含投资浮盈/减值/罚款，先拆出来再乘 PE，并在表中写明拆法
+- **PE 区间必须写依据**（自身 5/10 年均值与分位、同业），不得拍脑袋；默认不含历史极端高点
+- 至少给 FY+1 与 FY+2；FY+2 若只有单源要标注
+- 解释"现价落在哪一年的区间的什么位置"——这是把估值结论翻译成可执行价位的一步
+- 不含技术面（筹码/均线）——不在框架内且不可核验
+- 末尾附「更新记录」表，每次财报或一致预期变化后**追加一行、不覆盖**，让读者看到预期如何漂移
+
 #### 8. 总结段落
 100-200字的最终总结
 
@@ -209,7 +270,20 @@ This skill is generated from `skills/investment-team.md` so Claude Code and Code
 
 ### 第八步：保存报告
 
-将完整最终报告写入 `~/{公司名}投资研究报告_{日期}.md`（日期格式 YYYYMMDD）。
+按 CLAUDE.md 的目录规范写入 `reports/{公司名}/`：
+
+```
+reports/{公司名}/
+├── README.md                         — 研究框架概览 + 核心结论 + 四维评分表 + 关键检验点
+├── 00-数据底稿.md                     — 第一步⅞ 产出
+├── 01-商业模式分析-段永平视角.md
+├── 02-财务估值分析-巴菲特视角.md
+├── 03-行业竞争分析-芒格视角.md
+├── 04-风险管理层评估-李录视角.md
+└── 最终报告.md                       — 第七步产出
+```
+
+若目录内已有同一公司的旧报告，在 README 的「历史报告」区列出，并注明其基准日与已过期的口径（不要回改旧报告正文）。
 
 ### 第九步：数据抽检（准出流程）
 
@@ -235,8 +309,8 @@ python3 tools/report_audit.py verdict \
 ## 重要注意事项
 
 1. **4个Agent必须并行启动**——在同一条消息中调用4次Task工具
-2. **Agent通过SendMessage汇报**——不是文件协作，是消息通信
-3. **数据准确性**——要求Agent使用WebSearch搜索最新数据，关键数据交叉验证
+2. **Agent 把完整报告写进文件，只用 SendMessage 发摘要**——文件是交付物，消息是信号；四份底稿落盘后 team-lead 才能跑一致性检查
+3. **数据准确性**——基础数据只查一次（第一步⅞ 底稿），四个 Agent 只引不查；各自领域的增量数据用 WebSearch 并交叉验证
 4. **结论要明确**——不回避给出买入/观望/回避建议和具体价格区间
 5. **所有分析必须有数据支撑**——附数据来源
 6. **耐心等待**——4个Agent研究需要几分钟，实时向用户更新进度

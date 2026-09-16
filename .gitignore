@@ -38,3 +38,6 @@ reports/portfolio-latest.md
 
 # 懂车帝研究：涉及个人任职关系，只留本地（原目录已迁到 local/懂车帝/）
 /reports/懂车帝/
+
+# 本机权限配置（含白名单），不入库
+.claude/settings.local.json

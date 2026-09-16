@@ -13,6 +13,8 @@
          main() 中 print(json.dumps(...)) 遇到 €/→/★ 等字符抛
          UnicodeEncodeError 直接退出。
 
+另覆盖 consistency / lint 子命令与抽样器对评分行的排除。
+
 Zero external dependencies — 仅用 unittest，与 report_audit.py 本身保持一致。
 运行：  python tests/test_report_audit.py
 """
@@ -169,6 +171,156 @@ class TestGbkStdoutSurvival(unittest.TestCase):
             R._force_utf8_stdio()      # 不应抛异常
         finally:
             sys.stdout = orig
+
+
+
+class TestSamplerSkipsNonDataPoints(unittest.TestCase):
+    """评分 / 建议阈值不是可外部核验的数据点，不应进入抽检样本。"""
+
+    MD = (
+        "| 维度 | 判断 |\n|---|---|\n"
+        "| 生意质量 | 优秀（★4/5） |\n"
+        "| 估值 | 偏贵（★2/5） |\n\n"
+        "| 类型 | 建议 | 参考价格区间 |\n|---|---|---|\n"
+        "| 保守型 | 不参与 | 核心 PE ≤22x（约 $249） |\n\n"
+        "| 指标 | FY2025 |\n|---|---|\n"
+        "| 营收 | $4,028亿 |\n"
+    )
+
+    def test_scores_and_thresholds_excluded(self):
+        labels = [p['label'] for p in R.extract_data_points(self.MD)]
+        self.assertFalse(any('生意质量' in l or '估值' in l or '保守型' in l for l in labels),
+                         f"评分/阈值行被抽进了样本：{labels}")
+
+    def test_real_data_point_kept(self):
+        values = {p['reported_value'] for p in R.extract_data_points(self.MD)}
+        self.assertIn(4028.0, values)
+
+
+class TestSamplerSkipsYearsAndCounts(unittest.TestCase):
+    MD = (
+        "| 指标 | 值 | 来源 / 说明 |\n|---|---|---|\n"
+        "| 监管现金流出 | $52亿 | 2026-07 终局，欧盟 |\n"
+        "| FY2027 EPS | 14.88 | 卖方一致预期（54 位分析师） |\n"
+        "| 召回 | 3,067 辆 | NHTSA |\n"
+    )
+
+    def test_notes_column_years_and_counts_excluded(self):
+        pts = R.extract_data_points(self.MD)
+        values = {p['reported_value'] for p in pts}
+        self.assertIn(52.0, values)
+        self.assertIn(14.88, values)
+        self.assertNotIn(2026.0, values)
+        self.assertNotIn(54.0, values)
+        self.assertNotIn(3067.0, values)
+
+
+class TestConsistency(unittest.TestCase):
+    """多份底稿之间关键事实（指引 / 股价）打架必须被抓出来；修订语境要取现行值。"""
+
+    def _write(self, tmpdir, name, text):
+        path = os.path.join(tmpdir, name)
+        with open(path, 'w', encoding='utf-8') as fh:
+            fh.write(text)
+        return path
+
+    def test_conflicting_guidance_detected(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            files = [
+                self._write(d, '01-a.md', '# A\n2026年资本开支指引$1,800-1,900亿，股价 $340\n'),
+                self._write(d, '02-b.md', '# B\n2026年资本开支指引$1,950-2,050亿；股价 $349.39\n'),
+            ]
+            facts = R.collect_key_facts(files)
+            self.assertEqual(len(facts['资本开支指引']), 2)
+            import contextlib
+            with contextlib.redirect_stdout(io.StringIO()):
+                out = R.render_consistency(facts)
+            fields = {c['field'] for c in out['conflicts']}
+            self.assertIn('资本开支指引', fields)
+            self.assertIn('股价', fields, "2.8% 的股价快照差异应超过 2% 容差被标出")
+
+    def test_revision_line_takes_current_value(self):
+        """"已从$1,800-1,900亿上调至$1,950-2,050亿" 应取新值；"…$1,950-2,050亿，原指引$1,800-1,900亿" 亦然。"""
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            files = [
+                self._write(d, '01-a.md', '# A\nCapex指引已从年初的$1,800-1,900亿两次上调至$1,950-2,050亿\n'),
+                self._write(d, '02-b.md', '# B\n资本开支指引$1,950-2,050亿（2026-07-22上调，原指引$1,800-1,900亿）\n'),
+                self._write(d, '03-c.md', '# C\n2026年Capex指引$1,950-2,050亿，2026-07-22由$1,800-1,900亿上调\n'),
+            ]
+            facts = R.collect_key_facts(files)
+            mids = {round(h['value']) for h in facts['资本开支指引']}
+            self.assertEqual(mids, {2000}, f"修订语境应只保留现行值 1,950–2,050，实际：{facts['资本开支指引']}")
+
+    def test_conversion_and_buyback_prices_not_treated_as_quote(self):
+        """"转股价 $444.05" 不是现价；"回购市值 838.6 亿" 不是市值。"""
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            files = [self._write(d, '01-a.md', '# A\n股价 $349.39；上限转股价 $444.05；市值 $4.27万亿；回购市值 838.6亿\n')]
+            facts = R.collect_key_facts(files)
+            self.assertEqual([h['value'] for h in facts['股价']], [349.39])
+            self.assertEqual(len(facts['市值']), 1)
+
+    def test_peer_table_and_code_block_ignored(self):
+        """横评表一行多家公司的市值、代码块里工具输出的漂移股价，都不参与一致性比对。"""
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            files = [self._write(d, '02-b.md',
+                                 '# B\n股价 $349.39，市值 $4.27万亿\n'
+                                 '| 市值 | $4.22T | $3.72T | $1.69T |\n'
+                                 '```\n现价 345.51 USD × 股本 123.1 亿股 = 市值 42,528.8 亿美元\n```\n'
+                                 '2025 年回购 2.40 亿股按现价计市值 838.6亿\n')]
+            facts = R.collect_key_facts(files)
+            self.assertEqual([h['value'] for h in facts['股价']], [349.39])
+            self.assertEqual(len(facts['市值']), 1)
+            self.assertAlmostEqual(facts['市值'][0]['value'], 42700.0, places=6)
+
+    def test_meta_lines_are_ignored(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            files = [self._write(d, '最终报告.md',
+                                 '# F\n| 1 | 复核：三份报告指引各不相同（$1,800–1,900亿／$1,750–1,850亿） | 已订正 |\n'
+                                 '资本开支指引 $1,950-2,050亿\n')]
+            facts = R.collect_key_facts(files)
+            self.assertEqual(len(facts['资本开支指引']), 1)
+
+
+class TestLint(unittest.TestCase):
+    """CLAUDE.md 纪律：半星、主观表述为 FAIL；纯 ★ 1-5 个是合法写法。"""
+
+    def _lint(self, text):
+        import tempfile, contextlib
+        with tempfile.NamedTemporaryFile('w', suffix='.md', delete=False, encoding='utf-8') as fh:
+            fh.write(text)
+            path = fh.name
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                return R.lint_files([path])
+        finally:
+            os.unlink(path)
+
+    def test_half_star_fails(self):
+        out = self._lint('管理层评分：★★★☆☆（3.5/5）\n')
+        self.assertIn('HALF-STAR', {f['code'] for f in out['fails']})
+
+    def test_subjective_wording_fails_but_quotes_exempt(self):
+        out = self._lint('我认为这家公司显然很好\n> 巴菲特：显然，价格是你付出的\n')
+        subj = [f for f in out['fails'] if f['code'] == 'SUBJECTIVE']
+        self.assertEqual(len(subj), 1, "引用语录（> 开头）不应被判主观表述")
+
+    def test_plain_four_stars_is_legal(self):
+        out = self._lint('威胁等级 ★★★★\n护城河 ★★★★☆\n')
+        self.assertEqual(out['fails'], [])
+        self.assertFalse(any(w['code'] == 'STAR-COUNT' for w in out['warns']))
+
+    def test_star_count_warns_on_malformed(self):
+        out = self._lint('评分 ★★★★★★\n评分 ★★★☆\n')
+        self.assertEqual(sum(1 for w in out['warns'] if w['code'] == 'STAR-COUNT'), 2)
+
+    def test_unit_slip_warns(self):
+        out = self._lint('核心净利润 $138.28亿 ≈ $1,382.8亿\n')
+        self.assertTrue(any(w['code'] == 'UNIT-SLIP' for w in out['warns']))
 
 
 if __name__ == '__main__':

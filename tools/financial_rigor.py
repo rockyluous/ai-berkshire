@@ -374,6 +374,60 @@ def three_scenario_valuation(current_price, current_eps, shares_billion,
 
 
 # ---------------------------------------------------------------------------
+# 7. Forward Value Range (前瞻价值区间：FY+N 预期 EPS × PE 区间)
+# ---------------------------------------------------------------------------
+
+def forward_value_range(current_price, eps_by_year, pe_low, pe_high, pe_mid=None,
+                        eps_basis="", currency="", as_of=""):
+    """按财年输出 价值区间 = 预期EPS × [PE低, PE高]，中位价 = EPS × PE中位。
+
+    eps_by_year: list of (财年标签, 预期EPS)，按财年升序。
+    返回 rows 便于测试；同时打印可直接粘贴进报告「更新记录」表的 Markdown 行。
+    """
+    print("=" * 60)
+    print("前瞻价值区间 (Forward Value Range)")
+    print("=" * 60)
+
+    p = exact(current_price)
+    lo, hi = exact(pe_low), exact(pe_high)
+    mid = exact(pe_mid) if pe_mid is not None else _CTX.divide(_CTX.add(lo, hi), Decimal("2"))
+
+    print(f"  现价:     {p} {currency}    基准日: {as_of or '未标注'}")
+    print(f"  PE 区间:  {lo}–{hi}x  中位 {mid}x")
+    print(f"  EPS 口径: {eps_basis or '未标注（必须注明 GAAP / 非GAAP / 核心剔除一次性）'}")
+    print()
+    print(f"  {'财年':8} {'预期EPS':>9} {'价值区间':>22} {'中位价':>9} {'中位vs现价':>10} {'现价隐含PE':>10}")
+    print(f"  {'-'*8} {'-'*9} {'-'*22} {'-'*9} {'-'*10} {'-'*10}")
+
+    rows = []
+    for label, eps in eps_by_year:
+        e = exact(eps)
+        p_lo = _CTX.multiply(e, lo)
+        p_hi = _CTX.multiply(e, hi)
+        p_mid = _CTX.multiply(e, mid)
+        chg = float(p_mid - p) / float(p) * 100
+        implied = float(p) / float(e) if float(e) else float("nan")
+        print(f"  {label:8} {float(e):>9.2f} {float(p_lo):>10.1f}–{float(p_hi):<11.1f} "
+              f"{float(p_mid):>9.1f} {chg:>+9.1f}% {implied:>9.1f}x")
+        rows.append({"year": label, "eps": e, "low": p_lo, "high": p_hi,
+                     "mid": p_mid, "implied_pe": implied})
+
+    print()
+    print("  Markdown 更新记录行（粘贴进报告「前瞻价值区间 · 更新记录」表）：")
+    cells = [as_of or "—", eps_basis or "—", f"{lo}–{hi}", f"{mid}"]
+    for r in rows:
+        cells += [f"{float(r['eps']):.2f}",
+                  f"{float(r['low']):.1f}–{float(r['high']):.1f}",
+                  f"{float(r['mid']):.1f}"]
+    print("  | " + " | ".join(cells) + " |")
+    print()
+    print("  ⚠️ EPS 若含一次性损益（投资浮盈/减值/罚款），区间无意义——先剔除再算。")
+    print("  ⚠️ PE 区间必须写明依据（自身历史分位 / 同业），不得拍脑袋。")
+    print("  ✅ 所有计算使用精确十进制, 结果可审计复现")
+    return rows
+
+
+# ---------------------------------------------------------------------------
 # CLI Entry Point
 # ---------------------------------------------------------------------------
 
@@ -388,6 +442,7 @@ Examples:
   %(prog)s cross-validate --field revenue --values '{"年报": 7518, "Yahoo": 7500}' --unit 亿
   %(prog)s benford --values '[1234, 2345, 3456, ...]'
   %(prog)s calc --expr '510 * 9.11e9'
+  %(prog)s forward-range --price 349.39 --eps FY2026:12.10 FY2027:14.30 --pe 20 30 --eps-basis 核心 --as-of 2026-09-14
         """)
 
     sub = parser.add_subparsers(dest="command")
@@ -435,6 +490,17 @@ Examples:
     ts.add_argument("--years", type=int, default=3)
     ts.add_argument("--currency", default="")
 
+    # forward-range
+    fr = sub.add_parser("forward-range", help="前瞻价值区间：各财年预期EPS × PE区间")
+    fr.add_argument("--price", type=float, required=True, help="现价")
+    fr.add_argument("--eps", nargs="+", required=True,
+                    help="按财年给预期EPS，格式 FY2026:20.60 FY2027:23.10 ...")
+    fr.add_argument("--pe", nargs=2, type=float, required=True, help="PE区间 低 高，如 20 30")
+    fr.add_argument("--pe-mid", type=float, default=None, help="PE中位（默认取区间中点）")
+    fr.add_argument("--eps-basis", default="", help="EPS口径：GAAP / 非GAAP / 核心(剔除一次性)")
+    fr.add_argument("--as-of", default="", help="基准日 YYYY-MM-DD")
+    fr.add_argument("--currency", default="")
+
     _force_utf8_stdio()
     args = parser.parse_args()
 
@@ -451,6 +517,16 @@ Examples:
         benford_check(values)
     elif args.command == "calc":
         exact_calc(args.expr)
+    elif args.command == "forward-range":
+        pairs = []
+        for item in args.eps:
+            if ":" not in item:
+                print(f"  ❌ --eps 格式应为 财年:EPS，收到 {item!r}")
+                sys.exit(2)
+            label, val = item.split(":", 1)
+            pairs.append((label.strip(), float(val)))
+        forward_value_range(args.price, pairs, args.pe[0], args.pe[1], args.pe_mid,
+                            args.eps_basis, args.currency, args.as_of)
     elif args.command == "three-scenario":
         three_scenario_valuation(
             args.price, args.eps, args.shares,
