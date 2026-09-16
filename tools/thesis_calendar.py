@@ -175,7 +175,7 @@ def main():
     for t in out:
         tracked = t['last_tracked'] or '从未'
         never = '' if t['last_tracked'] else f'  {RED}← 从未跑过 /thesis-tracker{RESET}'
-        if t['last_tracked'] and t['last_tracked'] > today:
+        if t['last_tracked'] and date.fromisoformat(t['last_tracked']) > today:
             never = f'  {RED}← 追踪日期晚于今天，论文里的日期是猜的（写报告前先跑 date）{RESET}'
         print(f'\n{BOLD}{t["company"]}{RESET}  状态：{t["status"] or "未标"}  上次追踪：{tracked}{never}')
         if not t['has_calendar']:

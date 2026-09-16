@@ -16,7 +16,7 @@
 
 <!-- REPORTS-BANNER:START 由 tools/reports_index.py 自动更新，勿手改 -->
 
-> 📊 **日更内容是研究报告，全部在 [研究报告索引](reports/README.md)。** 2365 份报告 · 109 家公司 · 23 个专题，按公司与专题分组，更新至 2026-09-15。
+> 📊 **日更内容是研究报告，全部在 [研究报告索引](reports/README.md)。** 30 份报告 · 2 家公司 · 0 个专题，按公司与专题分组，更新至 2026-09-15。
 
 <!-- REPORTS-BANNER:END -->
 
@@ -657,7 +657,7 @@ REM 可选：安装 Codex slash prompts
 
 <!-- REPORTS-INDEX:START 由 tools/reports_index.py 自动更新，勿手改 -->
 
-**📊 [全部研究索引 →](reports/README.md)** ｜ 2365 份报告 · 109 家公司 · 23 个专题 · 更新至 2026-09-15
+**📊 [全部研究索引 →](reports/README.md)** ｜ 30 份报告 · 2 家公司 · 0 个专题 · 更新至 2026-09-15
 
 最近更新：
 
@@ -670,13 +670,7 @@ REM 可选：安装 Codex slash prompts
 
 <!-- REPORTS-INDEX:END -->
 
-| 公司 | 使用 Skill | 核心结论 | 报告链接 |
-|------|-----------|---------|---------|
-| 拼多多 (PDD) | `/investment-team` | 综合3.4/5，极度便宜但10年确定性不足，适合中等仓位 | [查看报告](reports/拼多多/) |
-| 腾讯控股 (0700.HK) | `/investment-research` | 社交垄断+资本配置卓越，14x前瞻PE合理偏低 | [查看报告](reports/腾讯/) |
-| 7家公司对比 | `/investment-checklist` | 茅台、腾讯通过；英伟达、美团、快手有条件通过；拼多多、泡泡玛特灰色 | [查看报告](reports/多公司对比-checklist-20260408.md) |
-| 大师持仓追踪 | 自定义研究 | 巴菲特/李录/段永平最新13F持仓+PDD成本分析 | [查看报告](reports/大师持仓追踪-research-20260408.md) |
-| 折扣零售产业链 | `/industry-research` | 逻辑链6环中2环已证伪（尾货供给枯竭、线上量价齐升）；最佳环节是奥莱物业与消费REITs而非线上特卖平台 | [查看报告](reports/折扣零售产业链/) |
+> 本仓库是 [xbtlin/ai-berkshire](https://github.com/xbtlin/ai-berkshire) 的 fork。上游作者的 2900 多份示例报告（拼多多、腾讯、七公司对比、折扣零售产业链等）请到上游仓库查看；这里只保留本仓库自己用 `/investment-team` 跑出来的研究（见上方索引）。
 
 > *更多报告将持续添加。欢迎 PR 提交你用本框架生成的研究报告。*
 
