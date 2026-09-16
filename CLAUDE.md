@@ -109,12 +109,19 @@ git push origin main
 python3 tools/reports_index.py --check
 ```
 
+```bash
+# 每周：哪些投资论文的检验点到期 / 逾期 / 从未追踪（退出码非 0 = 有逾期）
+python3 tools/thesis_calendar.py
+```
+
 ## 注意事项
 
 - 市值必须手算校验：股价 × 总股本，与报告市值对比
 - 货币单位要明确（港币/人民币/美元/新台币），防止混淆
 - PE/ROE等指标用 tools/financial_rigor.py 精确计算
 - 台股数据用 tools/twstock_data.py（FinMind）获取，并按 skills/financial-data.md 台股章节交叉验证
+- 团队研究的机器可读底稿：美股 `usstock_data.py datasheet`、A股 `ashare_data.py datasheet`、台股 `twstock_data.py datasheet`（同一 schema，`--check` 体检旧底稿）；港股暂无工具，手写 Markdown 底稿
+- 双算复核表的指标名用 `report_audit.py crosscheck --list-metrics` 里的基名，口径写括号
 - 报告写完后主动询问是否推送到GitHub
 - **推送前必须跑 `python3 tools/reports_index.py` 刷新索引**，否则 CI 的索引校验会失败
 - 新报告文件名带 `-YYYYMMDD` 后缀、正文首行写 `# 标题`，索引即可自动识别；

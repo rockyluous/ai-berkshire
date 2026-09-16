@@ -17,6 +17,9 @@
     python3 tools/twstock_data.py revenue 2330      # 近13个月月营收及同比（台股独有月度披露）
     python3 tools/twstock_data.py dividend 2330     # 近年股利政策
     python3 tools/twstock_data.py search 台積        # 搜索股票代码（支持繁体/代码）
+    python3 tools/twstock_data.py datasheet 2330 --price 1000 --as-of 2026-09-15 \\
+        --out reports/台积电/00-数据底稿.json         # 机器可读底稿（全队基准价）
+    python3 tools/twstock_data.py datasheet --check reports/台积电/00-数据底稿.json   # 体检旧底稿
 
 注意：
     - 所有金额单位为新台币（TWD）
@@ -358,6 +361,170 @@ def cmd_search(keyword):
 # CLI 入口
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# 机器可读底稿：与 usstock_data.py / ashare_data.py 同一 schema（ai-berkshire/datasheet/1）
+# ---------------------------------------------------------------------------
+
+_DATASHEET_SCHEMA = "ai-berkshire/datasheet/1"
+
+
+def _statements(stock_id, years=5):
+    """FinMind 损益表原始行（单季值）。"""
+    start = f"{date.today().year - years}-01-01"
+    return _get("TaiwanStockFinancialStatements", data_id=stock_id, start_date=start)
+
+
+def _annual_rows(rows):
+    years = {}
+    for r in rows:
+        if r["type"] not in _IS_KEYS:
+            continue
+        y = r["date"][:4]
+        d = years.setdefault(y, {"_quarters": set()})
+        d["_quarters"].add(r["date"])
+        d[r["type"]] = d.get(r["type"], 0) + (r["value"] or 0)
+    out = []
+    for y in sorted(years):
+        d = years[y]
+        nq = len(d["_quarters"])
+        rev, gp, op, ni = d.get("Revenue"), d.get("GrossProfit"), d.get("OperatingIncome"), d.get("EquityAttributableToOwnersOfParent")
+        out.append({
+            "year": y, "quarters": nq, "complete": nq == 4, "end": max(d["_quarters"]),
+            "revenue_yi": round(rev / 1e8, 2) if rev else None,
+            "gross_margin_pct": round(gp / rev * 100, 2) if gp and rev else None,
+            "operating_margin_pct": round(op / rev * 100, 2) if op and rev else None,
+            "net_income_yi": round(ni / 1e8, 2) if ni else None,
+            "eps": round(d["EPS"], 2) if d.get("EPS") else None,
+        })
+    return out
+
+
+def _quarter_rows(rows, n=8):
+    qs = {}
+    for r in rows:
+        if r["type"] not in _IS_KEYS:
+            continue
+        qs.setdefault(r["date"], {})[r["type"]] = r["value"]
+    out = []
+    for dt in sorted(qs)[-n:]:
+        d = qs[dt]
+        rev, op, ni = d.get("Revenue"), d.get("OperatingIncome"), d.get("EquityAttributableToOwnersOfParent")
+        out.append({"end": dt,
+                    "revenue_yi": round(rev / 1e8, 2) if rev else None,
+                    "operating_income_yi": round(op / 1e8, 2) if op else None,
+                    "net_income_yi": round(ni / 1e8, 2) if ni else None,
+                    "eps": d.get("EPS")})
+    return out
+
+
+def cmd_datasheet(stock_id, price=None, as_of=None, out=None):
+    """产出机器可读底稿 JSON：每个区块带 as_of（数据期末）与 fetched_at（实际取数时间）。"""
+    from datetime import datetime
+    name, board = _stock_name(stock_id)
+    fetched = datetime.now().isoformat(timespec="seconds")
+
+    if price is None:
+        prices = _get("TaiwanStockPrice", data_id=stock_id, start_date=_days_ago(14))
+        if prices:
+            price, as_of = prices[-1]["close"], as_of or prices[-1]["date"]
+            price_src = "FinMind TaiwanStockPrice 收盘价"
+        else:
+            price_src = "行情不可用"
+    else:
+        price_src = "手动锁定（--price）——全队基准价"
+
+    rows = _statements(stock_id)
+    annual, quarterly = _annual_rows(rows), _quarter_rows(rows)
+    shares = None
+    try:
+        shares = _latest_shares(stock_id)
+    except Exception:
+        pass
+
+    doc = {
+        "schema": _DATASHEET_SCHEMA,
+        "company": {"code": stock_id, "market": f"台股-{board or '未知'}", "name": name},
+        "basis": {
+            "price": price, "currency": "TWD",
+            "as_of": as_of or date.today().isoformat(),
+            "price_source": price_src,
+            "note": "本价为全队基准价；所有视角报告与工具调用一律传 --price 锁定，禁止各自实时取价",
+        },
+        "generated_at": fetched,
+        "sections": {
+            "shares": {"value": shares, "as_of": date.today().isoformat(),
+                       "note": "FinMind TaiwanStockShareholding 发行股数（近两周最新）",
+                       "source": "FinMind", "fetched_at": fetched, "evidence_level": "B-数据商转载"},
+            "annual": {"rows": annual, "as_of": annual[-1]["end"] if annual else None,
+                       "source": "FinMind TaiwanStockFinancialStatements（单季加总，complete=false 为非全年）",
+                       "fetched_at": fetched, "evidence_level": "B-数据商转载", "unit": "亿新台币；eps 为元"},
+            "quarterly": {"rows": quarterly, "as_of": quarterly[-1]["end"] if quarterly else None,
+                          "source": "FinMind TaiwanStockFinancialStatements（单季值）",
+                          "fetched_at": fetched, "evidence_level": "B-数据商转载"},
+        },
+        "stale_policy": {
+            "facts_ttl_hours": 24,
+            "rule": "fetched_at 超过 ttl 或 FinMind 已有更新季度 → 重跑本命令刷新；"
+                    "现金流、分部、指引等字段不在本文件内，见 Markdown 底稿并按 skills/financial-data.md 台股章节与 Goodinfo 交叉验证",
+        },
+    }
+    txt = json.dumps(doc, ensure_ascii=False, indent=2)
+    if out:
+        with open(out, "w", encoding="utf-8") as f:
+            f.write(txt + "\n")
+        print(f"✅ 机器可读底稿已写入 {out}")
+        print(f"   基准价 {price} TWD（{doc['basis']['as_of']}，{price_src}）")
+        print(f"   年度覆盖至 {doc['sections']['annual']['as_of']}，季度覆盖至 {doc['sections']['quarterly']['as_of']}")
+        print(f"   取数时间 {fetched}")
+    else:
+        print(txt)
+
+
+def cmd_datasheet_check(path, offline=False):
+    """新鲜度体检：取数多久了、覆盖到哪一期、FinMind 是否已有更新季度。"""
+    from datetime import datetime
+    with open(path, encoding="utf-8") as f:
+        doc = json.load(f)
+    if doc.get("schema") != _DATASHEET_SCHEMA:
+        raise RuntimeError(f"不是 datasheet 底稿（schema={doc.get('schema')!r}）")
+    comp = doc["company"]
+    print("=" * 66)
+    print(f"底稿新鲜度体检 — {comp.get('name')}（{comp.get('code')}，{comp.get('market')}）")
+    print("=" * 66)
+    print(f"  基准价 {doc['basis']['price']} {doc['basis']['currency']}   基准日 {doc['basis']['as_of']}")
+    ttl = doc.get("stale_policy", {}).get("facts_ttl_hours", 24)
+    stale, now = [], datetime.now()
+    for key, sec in doc["sections"].items():
+        fetched = sec.get("fetched_at", "")
+        try:
+            age_h = (now - datetime.fromisoformat(fetched)).total_seconds() / 3600
+        except ValueError:
+            age_h = float("inf")
+        if age_h > ttl:
+            stale.append(key)
+        print(f"  {key:<10s} 覆盖至 {str(sec.get('as_of')):<12s} 取数于 {fetched[:16]:<17s} "
+              f"（{age_h:.0f} 小时前，{'过期' if age_h > ttl else '新鲜'}）")
+    newer = None
+    if not offline:
+        try:
+            q = _quarter_rows(_statements(comp["code"], years=1), n=1)
+            latest = q[-1]["end"] if q else None
+            have = doc["sections"]["quarterly"].get("as_of")
+            if latest and have and latest > have:
+                newer = latest
+        except Exception as e:  # noqa: BLE001
+            print(f"  ⚠️ 无法联网核对最新季度（{e}）")
+    print("-" * 66)
+    if newer:
+        print(f"  ❌ FinMind 已有更新季度（{newer} > 底稿的 {doc['sections']['quarterly'].get('as_of')}）→ 必须重跑 datasheet")
+    elif stale:
+        print(f"  ⚠️ {len(stale)} 个区块的缓存已超过 {ttl} 小时（{'、'.join(stale)}），季度未变，可继续用；如需最新价请重跑")
+    else:
+        print("  ✅ 底稿新鲜，可直接复用（跨轮研究无需重新取数）")
+    print("=" * 66)
+    return 1 if newer else 0
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="台股数据工具 — FinMind 开放数据 API",
@@ -378,13 +545,27 @@ def main():
     p_search = sub.add_parser("search", help="搜索股票代码")
     p_search.add_argument("keyword", help="公司名（繁体）或代码")
 
+    p_ds = sub.add_parser("datasheet", help="产出机器可读底稿 JSON（带 as_of / fetched_at）；--check 体检旧底稿")
+    p_ds.add_argument("stock_id", nargs="?", help="股票代码，如 2330（--check 时可省略）")
+    p_ds.add_argument("--price", type=float, help="手动锁定基准价（全队基准价）")
+    p_ds.add_argument("--as-of", dest="as_of", help="基准日 YYYY-MM-DD")
+    p_ds.add_argument("--out", help="写入路径，如 reports/台积电/00-数据底稿.json")
+    p_ds.add_argument("--check", metavar="JSON", help="体检已有底稿的新鲜度")
+    p_ds.add_argument("--offline", action="store_true", help="--check 时不联网核对最新季度")
+
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
         sys.exit(1)
 
     try:
-        if args.command == "search":
+        if args.command == "datasheet":
+            if args.check:
+                sys.exit(cmd_datasheet_check(args.check, offline=args.offline))
+            if not args.stock_id:
+                p_ds.error("需要股票代码，或用 --check 体检已有底稿")
+            cmd_datasheet(args.stock_id, price=args.price, as_of=args.as_of, out=args.out)
+        elif args.command == "search":
             cmd_search(args.keyword)
         else:
             {

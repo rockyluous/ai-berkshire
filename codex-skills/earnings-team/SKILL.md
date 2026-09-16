@@ -45,6 +45,14 @@ This skill is generated from `skills/earnings-team.md` so Claude Code and Codex 
 | 管理层致股东信 | 年报中提取 | 高（仅年报时） |
 | 上一期财报/电话会 | 同上 | 高（用于承诺追踪） |
 
+**先看有没有共享底稿**：若 `reports/{公司名}/00-数据底稿.json` 存在（上一轮 /investment-team 产出），先体检：
+
+```bash
+python3 tools/usstock_data.py datasheet --check reports/{公司名}/00-数据底稿.json   # A股用 ashare_data.py，台股用 twstock_data.py
+```
+
+新季报已出 → 重跑 `datasheet` 刷新（传 `--price` 锁定本次基准价，并把新一期数字写进 `00-数据底稿.md`）。四个 Agent 的基础数据（股价/股本/上期与本期核心数字）**只引底稿**，各自联网只做本期增量（电话会、附注、竞品同期）。没有底稿的公司按上表取一手资料，并在报告头注明"无共享底稿，各视角自行取数"。
+
 **资料可得性评级**：
 
 | 等级 | 特征 | 影响 |
@@ -124,7 +132,7 @@ This skill is generated from `skills/earnings-team.md` so Claude Code and Codex 
 
    ```bash
    python3 tools/financial_rigor.py cross-validate \
-     --metric "revenue" --values {值1} {值2} --sources "来源1" "来源2"
+     --field 营收 --values '{"来源1": {值1}, "来源2": {值2}}' --unit 亿
    ```
 
 2. **现金流分析（最重要）**
@@ -299,6 +307,17 @@ This skill is generated from `skills/earnings-team.md` so Claude Code and Codex 
 
 ---
 
+### 合成后机器复核（必跑）
+
+```bash
+python3 tools/report_audit.py lint reports/{公司名}/{公司名}-earnings-{期间}-*.md
+python3 tools/report_audit.py consistency reports/{公司名}/{公司名}-earnings-{期间}-*.md
+```
+
+lint 有 FAIL（半星 / 主观表述）或 consistency 有冲突（四份对同一季度的营收、净利、股价写了不同的数）→ 先修再进入阶段三。财报精读此前没有任何机器复核，四份报告四个数的问题在这里同样会发生。
+
+---
+
 ## 阶段三：编辑润色 + 读者评审
 
 研究报告完成后，**并行**启动两个 Agent：
@@ -411,6 +430,16 @@ This skill is generated from `skills/earnings-team.md` so Claude Code and Codex 
 
 ---
 
+## 阶段四：回写投资论文（必做）
+
+财报是检验投资论文的天然时点。此前 /earnings-team 与 /thesis-tracker 互不相通，论文建了从没被财报检查过。定稿后：
+
+1. **已有 `reports/{公司名}/{公司名}-thesis.md`** → 按 `skills/thesis-tracker.md` 模式 B 执行：用本次四大师结论逐条检查「核心假设清单」与「红线清单」（🟢 / 🟡 / 🔴 / ⚫），算健康度，在「追踪记录」表**追加一行**（日期 | 健康度 | 核心变化 | 动作建议），并把下一个检验点（下季财报日等）补进「检验点日历」
+2. **没有论文** → 按 `skills/investment-team.md` 第八步半的模板建一份观察论文：核心假设从本次"最重要的 3 个变化"与四大师评分表转化，检验点日历至少写下季财报日
+3. 跑 `python3 tools/thesis_calendar.py --company {公司名}`，确认该公司不再有逾期检验点
+
+---
+
 ## 输出文件
 
 ```
@@ -421,7 +450,8 @@ reports/{公司名}/
 ├── {公司名}-earnings-{期间}-巴菲特.md     ← 财务质量审计
 ├── {公司名}-earnings-{期间}-芒格.md       ← 竞争格局解读
 ├── {公司名}-earnings-{期间}-李录.md       ← 风险信号分析
-└── {公司名}-earnings-{期间}-读者评审.md   ← 读者评审报告
+├── {公司名}-earnings-{期间}-读者评审.md   ← 读者评审报告
+└── {公司名}-thesis.md                     ← 阶段四：追加追踪记录（无则新建观察论文）
 ```
 
 ## 数据抽检（准出流程）
@@ -457,3 +487,4 @@ python3 tools/report_audit.py verdict \
 - **编辑不是降低专业度**：是让专业内容更易读，不是变成科普
 - **读者评审不是走过场**：真的站在读者角度挑毛病
 - **数据准确性**：关键数据交叉验证，使用 financial_rigor.py 工具验算
+- **财报必回写论文**：阶段四不是可选项；论文没被财报检查过等于没有论文

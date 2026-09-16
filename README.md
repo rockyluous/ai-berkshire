@@ -16,7 +16,7 @@
 
 <!-- REPORTS-BANNER:START 由 tools/reports_index.py 自动更新，勿手改 -->
 
-> 📊 **日更内容是研究报告，全部在 [研究报告索引](reports/README.md)。** 2346 份报告 · 110 家公司 · 23 个专题，按公司与专题分组，更新至 2026-09-12。
+> 📊 **日更内容是研究报告，全部在 [研究报告索引](reports/README.md)。** 2365 份报告 · 109 家公司 · 23 个专题，按公司与专题分组，更新至 2026-09-16。
 
 <!-- REPORTS-BANNER:END -->
 
@@ -657,18 +657,16 @@ REM 可选：安装 Codex slash prompts
 
 <!-- REPORTS-INDEX:START 由 tools/reports_index.py 自动更新，勿手改 -->
 
-**📊 [全部研究索引 →](reports/README.md)** ｜ 2346 份报告 · 110 家公司 · 23 个专题 · 更新至 2026-09-12
+**📊 [全部研究索引 →](reports/README.md)** ｜ 2365 份报告 · 109 家公司 · 23 个专题 · 更新至 2026-09-16
 
 最近更新：
 
 | 日期 | 报告 | 归属 |
 |------|------|------|
-| 2026-09-12 | [早期年度财务补录（用于重建长历史估值序列）](reports/持仓估值分位与未来盈利-20260912/早期年度财务补录.md) | 持仓估值分位与未来盈利 |
-| 2026-09-12 | [十家中概都便宜，只有两家不在历史低位](reports/持仓估值分位与未来盈利-20260912/公众号-中概十公司估值分位与未来盈利-20260912.md) | 持仓估值分位与未来盈利 |
-| 2026-09-12 | [1.9亿次请求要的不是答案，是思路：拆Anthropic蒸馏报告](reports/AI产业研究/公众号-Anthropic蒸馏报告-七家中国实验室与1.9亿次请求-20260912.md) | AI产业研究 |
-| 2026-09-07 | [数据核查与适用边界](reports/跨市场确定性筛选-20260907/audit-notes.md) | 跨市场确定性筛选 |
-| 2026-09-07 | [跨市场优质股票筛选研究报告](reports/跨市场确定性-funnel-20260907.md) | 综合与横评 |
-| 2026-09-07 | [贵州茅台护城河、文化、需求与十年利润研究报告](reports/茅台/贵州茅台护城河文化需求与十年利润研究报告-20260907.md) | 茅台 |
+| 2026-09-16 | [Microsoft（MSFT）投资论文](reports/Microsoft/Microsoft-thesis.md) | Microsoft |
+| 2026-09-15 | [Microsoft（MSFT）四大师团队研究 · 最终报告（Fable 5.1 · 完整新流程）](reports/Microsoft/最终报告.md) | Microsoft |
+| 2026-09-15 | [Alphabet（Google）投资论文](reports/Google/Google-thesis.md) | Google |
+| 2026-09-14 | [Alphabet（Google）四大师团队研究 · 最终报告（第二轮 · 共享底稿流程）](reports/Google/最终报告.md) | Google |
 
 <!-- REPORTS-INDEX:END -->
 

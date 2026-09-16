@@ -30,7 +30,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REPORTS = os.path.join(ROOT, 'reports')
 
 _SECTION_RE = re.compile(r'^#{1,6}\s*(.*)$')
-_FULL_DATE_RE = re.compile(r'(20\d\d)[-/年](\d{1,2})(?:[-/月](\d{1,2}))?')
+_FULL_DATE_RE = re.compile(r'(20\d\d)\s*[-/年]\s*(\d{1,2})(?:\s*[-/月]\s*(\d{1,2}))?')
 # "2027-01 / 04 / 07（各季财报）" 这种一年多月的写法：年月后面跟若干 "/ MM"
 _MULTI_MONTH_RE = re.compile(r'(20\d\d)-(\d{1,2})((?:\s*/\s*\d{1,2})+)')
 _ONGOING_RE = re.compile(r'持续|常态|每季|每次财报|随时|长期')
@@ -183,7 +183,7 @@ def main():
             if not args.all and r['status'] in ('future', 'checked', 'ongoing'):
                 continue
             color, name = label[r['status']]
-            when = r['date'] or r['when'][:24]
+            when = (r['date'][:7] if r.get('precision') == 'month' else r['date']) if r['date'] else r['when'][:24]
             print(f'  {color}{name:<5s}{RESET} {when:<12s} {r["what"][:60]}'
                   + (f'  （假设 {r["hyp"]}）' if r['hyp'] else ''))
     print('-' * 70)

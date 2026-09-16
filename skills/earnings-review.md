@@ -80,7 +80,7 @@
 ```bash
 # 收入和净利润交叉验证（至少2个来源）
 python3 tools/financial_rigor.py cross-validate \
-  --metric "revenue" --values 108.3e9 107.9e9 --sources "公司财报" "Yahoo Finance"
+  --field 营收 --values '{"公司财报": 1083, "Yahoo Finance": 1079}' --unit 亿
 
 # 市值校验
 python3 tools/financial_rigor.py verify-market-cap \
