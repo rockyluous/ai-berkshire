@@ -2,19 +2,19 @@
   "count": 2365,
   "reports": [
     {
-      "title": "Microsoft（MSFT）投资论文",
-      "path": "reports/Microsoft/Microsoft-thesis.md",
+      "title": "Microsoft（MSFT）四大师团队研究 · 最终报告（Fable 5.1 · 完整新流程）",
+      "path": "reports/Microsoft/最终报告.md",
       "bucket": "公司",
       "group": "Microsoft",
       "series": "",
       "type": "研究",
-      "date": "2026-09-16",
+      "date": "2026-09-15",
       "date_source": "正文",
       "ticker": ""
     },
     {
-      "title": "Microsoft（MSFT）四大师团队研究 · 最终报告（Fable 5.1 · 完整新流程）",
-      "path": "reports/Microsoft/最终报告.md",
+      "title": "Microsoft（MSFT）投资论文",
+      "path": "reports/Microsoft/Microsoft-thesis.md",
       "bucket": "公司",
       "group": "Microsoft",
       "series": "",

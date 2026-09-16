@@ -16,7 +16,7 @@
 
 <!-- REPORTS-BANNER:START 由 tools/reports_index.py 自动更新，勿手改 -->
 
-> 📊 **日更内容是研究报告，全部在 [研究报告索引](reports/README.md)。** 2365 份报告 · 109 家公司 · 23 个专题，按公司与专题分组，更新至 2026-09-16。
+> 📊 **日更内容是研究报告，全部在 [研究报告索引](reports/README.md)。** 2365 份报告 · 109 家公司 · 23 个专题，按公司与专题分组，更新至 2026-09-15。
 
 <!-- REPORTS-BANNER:END -->
 
@@ -657,14 +657,14 @@ REM 可选：安装 Codex slash prompts
 
 <!-- REPORTS-INDEX:START 由 tools/reports_index.py 自动更新，勿手改 -->
 
-**📊 [全部研究索引 →](reports/README.md)** ｜ 2365 份报告 · 109 家公司 · 23 个专题 · 更新至 2026-09-16
+**📊 [全部研究索引 →](reports/README.md)** ｜ 2365 份报告 · 109 家公司 · 23 个专题 · 更新至 2026-09-15
 
 最近更新：
 
 | 日期 | 报告 | 归属 |
 |------|------|------|
-| 2026-09-16 | [Microsoft（MSFT）投资论文](reports/Microsoft/Microsoft-thesis.md) | Microsoft |
 | 2026-09-15 | [Microsoft（MSFT）四大师团队研究 · 最终报告（Fable 5.1 · 完整新流程）](reports/Microsoft/最终报告.md) | Microsoft |
+| 2026-09-15 | [Microsoft（MSFT）投资论文](reports/Microsoft/Microsoft-thesis.md) | Microsoft |
 | 2026-09-15 | [Alphabet（Google）投资论文](reports/Google/Google-thesis.md) | Google |
 | 2026-09-14 | [Alphabet（Google）四大师团队研究 · 最终报告（第二轮 · 共享底稿流程）](reports/Google/最终报告.md) | Google |
 

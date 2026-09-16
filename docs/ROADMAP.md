@@ -27,9 +27,9 @@
 ## P2：长期（6个月+）
 
 ### 测试覆盖
-- 为核心工具（financial_rigor.py 等）增加单元测试
-- 为 Skill 输出增加回归测试
-- 确保迭代不破坏已有功能
+- ✅ 核心工具单元测试：`tests/`（financial_rigor / report_audit / usstock_data），`python3 -m unittest discover tests`
+- ✅ CI：`.github/workflows/ci.yml` 跑测试 + 索引校验 + Codex 同步校验
+- 为 Skill 输出增加回归测试（未做）
 
 ### 组合级分析
 - 持仓组合健康度评估

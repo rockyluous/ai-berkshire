@@ -2,7 +2,9 @@
 # 记录用户指令到日志文件
 # 由 user_prompt_submit hook 调用，stdin 接收用户输入
 
-LOG_DIR="$HOME/ai-berkshire/logs"
+# 日志目录跟随脚本所在仓库，不再硬编码 ~/ai-berkshire（本机克隆路径不同）
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+LOG_DIR="$REPO_DIR/logs"
 LOG_FILE="$LOG_DIR/command-log.jsonl"
 COUNTER_FILE="$LOG_DIR/.counter"
 

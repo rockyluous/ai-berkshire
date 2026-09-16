@@ -3,7 +3,7 @@
 > 本文件由 `tools/reports_index.py` 自动生成，请勿手工编辑。
 > 新增报告后运行 `python3 tools/reports_index.py` 重新生成。
 
-**2365 份报告** · **109 家公司** · **23 个专题** · 最近更新 2026-09-16
+**2365 份报告** · **109 家公司** · **23 个专题** · 最近更新 2026-09-15
 
 [最近更新](#最近更新) · [按公司](#按公司) · [专题研究](#专题研究) · [大师研究](#大师研究) · [筛选池](#筛选池)
 
@@ -13,8 +13,8 @@
 
 | 日期 | 报告 | 归属 | 类型 |
 |------|------|------|------|
-| 2026-09-16 | [Microsoft（MSFT）投资论文](Microsoft/Microsoft-thesis.md) | Microsoft | 研究 |
 | 2026-09-15 | [Microsoft（MSFT）四大师团队研究 · 最终报告（Fable 5.1 · 完整新流程）](Microsoft/最终报告.md) | Microsoft | 研究 |
+| 2026-09-15 | [Microsoft（MSFT）投资论文](Microsoft/Microsoft-thesis.md) | Microsoft | 研究 |
 | 2026-09-15 | [Microsoft（MSFT）风险与管理层评估 · 李录视角 · 2026-09-15](Microsoft/04-风险管理层评估-李录视角.md) | Microsoft | 组织管理 |
 | 2026-09-15 | [Alphabet（Google）投资论文](Google/Google-thesis.md) | Google | 研究 |
 | 2026-09-14 | [Alphabet（Google）四大师团队研究 · 最终报告（第二轮 · 共享底稿流程）](Google/最终报告.md) | Google | 研究 |
@@ -1478,12 +1478,12 @@
 </details>
 
 <details>
-<summary><b>Microsoft</b> · 7 份 · 最近 2026-09-16</summary>
+<summary><b>Microsoft</b> · 7 份 · 最近 2026-09-15</summary>
 
-- `2026-09-16` [Microsoft（MSFT）投资论文](Microsoft/Microsoft-thesis.md) — 研究
 - `2026-09-15` [Microsoft（MSFT）风险与管理层评估 · 李录视角 · 2026-09-15](Microsoft/04-风险管理层评估-李录视角.md) — 组织管理
 - `2026-09-15` [Microsoft（MSFT）财务与估值分析——巴菲特视角](Microsoft/02-财务估值分析-巴菲特视角.md) — 估值仓位
 - `2026-09-15` [Microsoft（MSFT）行业竞争分析——芒格视角（2026-09-15 基准，基准价 $497.12）](Microsoft/03-行业竞争分析-芒格视角.md) — 研究
+- `2026-09-15` [Microsoft（MSFT）投资论文](Microsoft/Microsoft-thesis.md) — 研究
 - `2026-09-15` [Microsoft（MSFT）四大师团队研究 · 最终报告（Fable 5.1 · 完整新流程）](Microsoft/最终报告.md) — 研究
 - `2026-09-15` [Microsoft（MSFT）商业模式与护城河分析 · 段永平视角（基准日 2026-09-15）](Microsoft/01-商业模式分析-段永平视角.md) — 研究
 - `2026-09-15` [Microsoft（MSFT）共享数据底稿 · 2026-09-15](Microsoft/00-数据底稿.md) — 底稿

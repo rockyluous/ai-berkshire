@@ -340,33 +340,53 @@ class TestCrosscheck(unittest.TestCase):
             "| 优先股稀释率 | 0.39% | financial_rigor calc '335e6/20*2.842/12.23e9*100' |\n"
             "| 核心PE | 34.60 | 独立复算 |\n")
 
-    def _run(self, required=None):
+    def _run(self, required=None, fin=None, risk=None, capture=True):
         import tempfile, contextlib
         with tempfile.TemporaryDirectory() as d:
-            for name, body in (('02-fin.md', self.FIN), ('04-risk.md', self.RISK)):
+            for name, body in (('02-fin.md', fin or self.FIN), ('04-risk.md', risk or self.RISK)):
                 with open(os.path.join(d, name), 'w', encoding='utf-8') as fh:
                     fh.write(body)
             files = [os.path.join(d, n) for n in ('02-fin.md', '04-risk.md')]
             dual = R.collect_dual_calc(files)
+            if not capture:
+                return dual, R.render_crosscheck(dual, required or [])
             with contextlib.redirect_stdout(io.StringIO()):
                 return dual, R.render_crosscheck(dual, required or [])
 
     def test_extracts_table(self):
+        """「优先股稀释率」按后缀归到字典基名「稀释率」，两个角色的值才能配上对。"""
         dual, _ = self._run()
         self.assertIn('核心PE', dual)
-        self.assertEqual(len(dual['优先股稀释率']), 2)
+        self.assertNotIn('优先股稀释率', dual)
+        self.assertEqual(len(dual['稀释率']), 2)
+        self.assertTrue(all(r['in_dict'] for r in dual['稀释率']))
 
     def test_twentyfold_error_detected(self):
-        _, out = self._run()
-        self.assertEqual([m['metric'] for m in out['mismatch']], ['优先股稀释率'])
+        """两方都标了同一口径 → 20 倍差直接判不一致。"""
+        _, out = self._run(fin=self.FIN.replace('| 优先股稀释率 |', '| 优先股稀释率(存托股换算) |'),
+                           risk=self.RISK.replace('| 优先股稀释率 |', '| 优先股稀释率(存托股换算) |'))
+        self.assertEqual([m['metric'] for m in out['mismatch']], ['稀释率'])
+
+    def test_twentyfold_error_without_qualifier_is_not_a_pass(self):
+        """稀释率是口径敏感指标：都没标口径时判"口径未标"，但绝不能打【通过】——20 倍错就长这样。"""
+        import contextlib
+        with contextlib.redirect_stdout(io.StringIO()) as buf:
+            _, out = self._run(capture=False)
+        self.assertEqual(out['unqualified'], ['稀释率'])
+        self.assertNotIn('稀释率', out['agreed'])
+        self.assertNotIn('【通过】', buf.getvalue())
+        self.assertIn('【待补口径】', buf.getvalue())
 
     def test_agreement_passes(self):
         _, out = self._run()
         self.assertIn('核心PE', out['agreed'])
 
     def test_single_calc_reported_not_failed(self):
-        _, out = self._run()
-        self.assertIn('核心TTMEPS', out['single'])
+        """「核心TTM EPS」是「核心EPS」的别名：归一后仍只被一个角色算过，报"仅单算"而非漏项。"""
+        dual, out = self._run()
+        self.assertIn('核心EPS', dual)
+        self.assertNotIn('核心TTMEPS', dual)
+        self.assertIn('核心EPS', out['single'])
 
     def test_no_dual_tables_is_not_reported_as_pass(self):
         import contextlib
@@ -416,6 +436,56 @@ class TestFileLevelLint(unittest.TestCase):
 
 
 
+class TestFutureDate(unittest.TestCase):
+    """过程日期（建立/核验/生成/基准）不能晚于今天；检验点/到期/财报日等将来日期不受限。"""
+
+    TODAY = __import__('datetime').date(2026, 9, 15)
+
+    def _lint(self, text):
+        import tempfile, contextlib
+        with tempfile.NamedTemporaryFile('w', suffix='.md', delete=False, encoding='utf-8') as fh:
+            fh.write(text)
+            path = fh.name
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                return R.lint_files([path], today=self.TODAY)
+        finally:
+            os.unlink(path)
+
+    def _future_lines(self, text):
+        out = self._lint(text)
+        return [f['line'] for f in out['fails'] if f['code'] == 'FUTURE-DATE']
+
+    def test_prose_process_date_in_future_fails(self):
+        self.assertEqual(self._future_lines('# X\n\n> 建立日期：2026-09-16　｜　基准价：$497\n'), [3])
+
+    def test_prose_process_date_today_or_past_ok(self):
+        self.assertEqual(self._future_lines('> 建立日期：2026-09-15 ｜ 生成于 2026-09-01\n'), [])
+
+    def test_review_table_check_date_column(self):
+        md = ('## 10. team-lead 复核记录\n\n'
+              '| # | 事项 | 处理 | 依据 | 核验日期 |\n|---|---|---|---|---|\n'
+              '| 1 | 底稿 §7 | 订正 | 10-K Note 1 | 2026-09-16 |\n'
+              '| 2 | 底稿 §4 | 证实 | 10-K | 2026-09-15 |\n')
+        self.assertEqual(self._future_lines(md), [5])
+
+    def test_tracking_table_under_process_section(self):
+        md = ('## 追踪记录\n\n| 日期 | 事件 | 状态 |\n|---|---|---|\n| 2026-09-16 | 论文建立 | 初始 |\n')
+        self.assertEqual(self._future_lines(md), [5])
+
+    def test_checkpoint_calendar_future_dates_allowed(self):
+        md = ('## 检验点日历\n\n| 日期 / 触发事件 | 要看什么 | 对应假设# |\n|---|---|---|\n'
+              '| 2026-10-28 | Q1 FY27 财报 | 1 |\n| 2027-02 | CMA 裁定 | 6 |\n\n'
+              '下一次财报约 2026-10-28，欧盟整改期 2026-09-21 届满。\n')
+        self.assertEqual(self._future_lines(md), [])
+
+    def test_cn_date_format(self):
+        self.assertEqual(self._future_lines('数据截止 2026年9月20日\n'), [1])
+
+    def test_code_block_ignored(self):
+        self.assertEqual(self._future_lines('```\n建立日期：2026-12-31\n```\n'), [])
+
+
 class TestEvidenceLedger(unittest.TestCase):
     """证据台账：汇总各视角的底稿抽查，作为 ⚠️→✅ 的升级凭据。"""
 
@@ -437,8 +507,12 @@ class TestEvidenceLedger(unittest.TestCase):
                 return rows, R.render_evidence(rows)
 
     def test_verdicts_bucketed(self):
-        _, out = self._run()
-        self.assertEqual((out['confirmed'], out['refuted'], out['unverifiable']), (2, 1, 1))
+        """「折旧影响」一行有来源但缺核验日期，按规则降为"证实(凭据不全)"，不计入 confirmed。"""
+        rows, out = self._run()
+        self.assertEqual((out['confirmed'], out['refuted'], out['unverifiable']), (1, 1, 1))
+        incomplete = [r for r in rows if r['verdict'] == '证实(凭据不全)']
+        self.assertEqual([r['item'] for r in incomplete], ['折旧影响'])
+        self.assertEqual(incomplete[0]['why'], '缺核验日期')
 
     def test_check_date_not_taken_from_source_column(self):
         """来源列里的文件日期不能被当成核验日期。"""

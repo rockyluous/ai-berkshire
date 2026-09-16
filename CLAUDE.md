@@ -86,7 +86,7 @@ reports/{公司名}/
 
 ## GitHub 操作
 
-- 本地克隆路径：`~/ai-berkshire/`
+- 本地克隆路径：`~/Documents/github/ai-berkshire/`（README 与 AGENTS.md 面向外部用户写的是 `~/ai-berkshire/`，本机不同）
 - 远程仓库：`https://github.com/xbtlin/ai-berkshire.git`
 - 推送前先 `git pull --rebase origin main`（远程经常有新提交）
 - commit message 用中文，描述清楚改了什么
@@ -96,7 +96,7 @@ reports/{公司名}/
 
 ```bash
 # 推送报告到GitHub
-cd ~/ai-berkshire
+cd ~/Documents/github/ai-berkshire
 python3 tools/reports_index.py          # 先刷新研究索引（必做）
 git add reports/xxx.md reports/README.md reports/index.json README.md
 git commit -m "添加xxx报告"
@@ -105,7 +105,7 @@ git push origin main
 ```
 
 ```bash
-# 只检查索引是否过期，不写盘（CI 也跑这条）
+# 只检查索引是否过期，不写盘（.github/workflows/ci.yml 也跑这条）
 python3 tools/reports_index.py --check
 ```
 
@@ -116,6 +116,7 @@ python3 tools/thesis_calendar.py
 
 ## 注意事项
 
+- **写任何报告前先跑 `date`（本地时间，不是 `date -u`）确认今天日期**，建立日期/核验日期/基准日/生成日期一律用它。本机是 PDT，下午 5 点后 UTC 已是次日——实测一轮研究把 13 处过程日期写成了次日，就是拿了 UTC 日期。`report_audit.py lint` 会把晚于今天的过程日期判 FAIL；检验点/财报日这类将来日期不受限
 - 市值必须手算校验：股价 × 总股本，与报告市值对比
 - 货币单位要明确（港币/人民币/美元/新台币），防止混淆
 - PE/ROE等指标用 tools/financial_rigor.py 精确计算

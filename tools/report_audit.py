@@ -905,6 +905,9 @@ def render_crosscheck(dual: dict, required=None, tol: float = 0.01, verbose: boo
         print(f'  {RED}以下必算指标没有被两个角色各算一次：{RESET}{"、".join(missing)}')
     if mismatch or missing:
         print(f'{BOLD}{RED}【打回】派生指标的双算未通过——先确认谁算错了，再汇总。{RESET}')
+    elif unqualified:
+        # 值不同、口径又没标，既可能是口径差也可能是算错（实测 20 倍错就长这样）——补齐口径前不能算通过
+        print(f'{BOLD}{YELLOW}【待补口径】{len(unqualified)} 个口径敏感指标值不同且有角色未标口径——补括号口径后重跑，才能判通过。{RESET}')
     else:
         print(f'{BOLD}{GREEN}【通过】双算指标全部一致。{RESET}')
     print('=' * 70)
@@ -1095,6 +1098,75 @@ def _file_level_lint(text: str) -> list:
     return items
 
 
+# 未来日期：核验/建立/更新/生成/基准这类"什么时候做的"日期不可能晚于今天。
+# 实测一轮研究把建立日期与 12 条核验日期全部写成了次日（模型没跑 date 就猜了日期），
+# thesis_calendar 与索引都照单全收。检验点/到期/财报日这类"将来要看"的日期不在此列。
+_FUTURE_KEY_RE = re.compile(r'建立日期|核验日期|基准日|生成于|更新日期|数据截止|截至日期|追踪日期|研究日期|取数日期|fetched_at|as_of')
+_TABLE_DATE_COL_RE = re.compile(r'核验|建立|更新|追踪|生成|取数|研究|基准')
+_PROCESS_SECTION_RE = re.compile(r'追踪记录|更新记录|复核记录|证据台账|抽查')
+_ANY_DATE_RE = re.compile(r'(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})|(20\d{2})年(\d{1,2})月(\d{1,2})日')
+
+
+def _dates_in(text: str):
+    for m in _ANY_DATE_RE.finditer(text):
+        g = [x for x in m.groups() if x is not None]
+        try:
+            yield date_mod(int(g[0]), int(g[1]), int(g[2])), m.group(0)
+        except ValueError:
+            continue
+
+
+def _future_date_lint(lines: list, today=None) -> list:
+    today = today or date_mod.today()
+    items = []
+    section = ''
+    date_cols = None          # 当前表格里哪些列是"过程日期"列
+    in_code = False
+
+    def _hit(lineno, raw, found):
+        items.append({'code': 'FUTURE-DATE', 'level': 'FAIL', 'line': lineno,
+                      'desc': f'过程日期 {found} 晚于今天 {today.isoformat()}——写报告前先跑 date（本地时间；傍晚后 UTC 已是次日）',
+                      'raw': raw.strip()[:90]})
+
+    for lineno, line in enumerate(lines, start=1):
+        st = line.strip()
+        if st.startswith('```'):
+            in_code = not in_code
+            continue
+        if in_code:
+            continue
+        if st.startswith('#'):
+            section = st.lstrip('#').strip()
+            date_cols = None
+            continue
+        if st.startswith('|'):
+            cells = [c.strip() for c in st.strip('|').split('|')]
+            if date_cols is None:
+                # 表头行：找过程日期列
+                cols = []
+                for i, c in enumerate(cells):
+                    if '日期' in c and (_TABLE_DATE_COL_RE.search(c) or _PROCESS_SECTION_RE.search(section)):
+                        cols.append(i)
+                date_cols = cols
+                continue
+            if re.fullmatch(r'[\s\-:|]+', st):
+                continue
+            for i in date_cols:
+                if i < len(cells):
+                    for d, found in _dates_in(cells[i]):
+                        if d > today:
+                            _hit(lineno, line, found)
+            continue
+        date_cols = None
+        for km in _FUTURE_KEY_RE.finditer(line):
+            window = line[km.end():km.end() + 24]
+            for d, found in _dates_in(window):
+                if d > today:
+                    _hit(lineno, line, found)
+                break
+    return items
+
+
 def _unit_slip(line: str) -> bool:
     nums = [_clean_num(x) for x in re.findall(r'\$\s*([\d,，]+(?:\.\d+)?)\s*亿', line)]
     nums = [n for n in nums if n]
@@ -1106,7 +1178,7 @@ def _unit_slip(line: str) -> bool:
     return False
 
 
-def lint_files(files: list) -> dict:
+def lint_files(files: list, today=None) -> dict:
     BOLD, RED, YELLOW, GREEN, RESET = '\033[1m', '\033[91m', '\033[93m', '\033[92m', '\033[0m'
     print('=' * 70)
     print(f'{BOLD}报告 lint — 格式与纪律{RESET}')
@@ -1135,7 +1207,7 @@ def lint_files(files: list) -> dict:
                     item = {'file': os.path.basename(path), 'line': lineno, 'code': code,
                             'desc': desc, 'raw': line.strip()[:90]}
                     (fails if level == 'FAIL' else warns).append(item)
-        for fl in _file_level_lint('\n'.join(lines)):
+        for fl in _file_level_lint('\n'.join(lines)) + _future_date_lint(lines, today):
             fl['file'] = os.path.basename(path)
             (fails if fl['level'] == 'FAIL' else warns).append(fl)
     for it in fails:
@@ -1270,7 +1342,7 @@ def main():
     python3 tools/report_audit.py evidence --dir reports/腾讯 \
       --company 腾讯 --out reports/腾讯/00-证据台账.md
 
-  格式与纪律 lint（半星 / 主观表述 / 无日期指引 / 单位错位 / 派生指标无算式）：
+  格式与纪律 lint（半星 / 主观表述 / 无日期指引 / 单位错位 / 派生指标无算式 / 过程日期晚于今天）：
     python3 tools/report_audit.py lint reports/腾讯/0*.md
 
   上轮复核记录 → 本轮抽查清单（新一轮研究做底稿时先跑，贴进 00-数据底稿.md）：
@@ -1321,9 +1393,10 @@ def main():
     ev.add_argument('--output-json', action='store_true')
 
     # lint
-    lnt = sub.add_parser('lint', help='格式与纪律 lint（半星/主观表述/无日期指引/单位错位/派生指标无算式）')
+    lnt = sub.add_parser('lint', help='格式与纪律 lint（半星/主观表述/无日期指引/单位错位/派生指标无算式/过程日期晚于今天）')
     lnt.add_argument('files', nargs='+', help='报告文件（可多个）')
     lnt.add_argument('--output-json', action='store_true')
+    lnt.add_argument('--today', help='指定"今天"（YYYY-MM-DD），用于测试或回溯 lint 旧报告')
 
     # review-items
     rv = sub.add_parser('review-items', help='把上轮最终报告的「复核记录」转成本轮底稿抽查清单')
@@ -1392,7 +1465,7 @@ def main():
         sys.exit(1 if outcome['refuted'] else 0)
 
     elif args.command == 'lint':
-        outcome = lint_files(args.files)
+        outcome = lint_files(args.files, today=date_mod.fromisoformat(args.today) if args.today else None)
         if args.output_json:
             print(json.dumps(outcome, ensure_ascii=False, indent=2))
         sys.exit(1 if outcome['fails'] else 0)
