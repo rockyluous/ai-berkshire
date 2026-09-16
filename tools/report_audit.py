@@ -134,11 +134,20 @@ _KV_LABEL_RE = re.compile(
 
 
 def _parse_md_tables(lines: list) -> list:
-    """解析 Markdown 中所有表格，返回 (row_label, col_header, value, unit, lineno, raw) 列表。"""
+    """解析 Markdown 中所有表格，返回 (row_label, col_header, value, unit, lineno, raw, heading) 列表。
+
+    heading 是该表格上方最近的标题文本，供调用方跳过"复核记录 / 版本对照 / 成本"等流程元数据表。
+    """
     results = []
+    heading = ''
     i = 0
     while i < len(lines):
         line = lines[i].strip()
+        hm = re.match(r'^#{1,6}\s+(.*)$', line)
+        if hm:
+            heading = hm.group(1).strip()
+            i += 1
+            continue
         # 检测表头行（含 | 且不是分隔行）
         if '|' in line and not re.match(r'^\|[\-\s\|:]+\|$', line):
             headers_raw = [h.strip().strip('*_').strip() for h in line.split('|')]
@@ -169,7 +178,7 @@ def _parse_md_tables(lines: list) -> list:
                             val = _clean_num(m.group(1))
                             unit = (m.group(2) or '').strip()
                             if val is not None and val != 0 and abs(val) < 1e15:
-                                results.append((row_label, col_header, val, unit, i + 1, dline))
+                                results.append((row_label, col_header, val, unit, i + 1, dline, heading))
                     i += 1
                 continue
         i += 1
@@ -183,11 +192,20 @@ def _looks_like_year_or_count(val, unit: str, raw: str) -> bool:
     """无单位的 1900–2100 整数当年份；"54 位分析师""3,067 辆"这类计数不是财务数据点。"""
     if unit == '' and float(val).is_integer() and 1900 <= val <= 2100:
         return True
+    # "FY26 / Q4 / H1 / FY2027" 这类期间前缀里的数字不是数据点
+    if float(val).is_integer() and re.search(r'(?:FY|Q|H)\s*' + str(int(val)) + r'(?!\d)', raw):
+        return True
     for m in _COUNT_WORD_RE.finditer(raw):
         n = _clean_num(m.group(1))
         if n is not None and abs(n - val) < 1e-9:
             return True
     return False
+
+
+# 流程元数据表（复核记录 / 版本对照 / 成本统计 / 抽查与双算表 / 更新记录）里的数字与公司无关，
+# 抽进样本只会核到"壁钟 7.4 分钟"这类东西，白占 15% 的抽检名额。
+_META_HEADING_RE = re.compile(r'复核记录|对照|成本|更新记录|抽查|双算|证据|进度|token|壁钟|信源|来源分级|数据来源|方法论|交叉质询', re.I)
+_META_ROW_RE = re.compile(r'token|壁钟|分钟|行数|工具调用|子\s*Agent|\bKB\b|版本|v\d\s*[（(→]', re.I)
 
 
 def extract_data_points(md_text: str) -> list:
@@ -233,7 +251,10 @@ def extract_data_points(md_text: str) -> list:
     in_code = False
 
     # --- 1. 多列表格 ---
-    for row_label, col_header, val, unit, lineno, raw in _parse_md_tables(lines):
+    for row_label, col_header, val, unit, lineno, raw, heading in _parse_md_tables(lines):
+        # 流程元数据表不是公司数据
+        if _META_HEADING_RE.search(heading) or _META_ROW_RE.search(row_label):
+            continue
         # 跳过无意义行标签
         if not _is_valid_label(row_label):
             continue
@@ -241,7 +262,7 @@ def extract_data_points(md_text: str) -> list:
         if col_header.upper() in ('YOY', 'YOY增速', '增速', '同比', '变化', '趋势', '说明', '备注'):
             continue
         # "来源 / 说明""口径""角色""期末"这类列装的是注释，不是待核验数据
-        if any(k in col_header for k in ('来源', '说明', '备注', '口径', '角色', '期末', '日期', '更新', '同业', '对比', '可比', '对照')):
+        if any(k in col_header for k in ('来源', '说明', '备注', '口径', '角色', '期末', '日期', '更新', '同业', '对比', '可比', '对照', '算式', '工具', '依据')):
             continue
         if _looks_like_year_or_count(val, unit, raw):
             continue
@@ -274,12 +295,47 @@ def extract_data_points(md_text: str) -> list:
     return points
 
 
-def sample_points(points: list, ratio: float = 0.15, seed: int = None) -> list:
-    """随机抽取 ratio 比例的数据点，最少 3 个，最多 30 个。"""
+# 一手引用标记：行内出现这些字样，说明该数据点声称有一手出处，抽到它才能核"引对了没有"
+_PRIMARY_CITE_RE = re.compile(
+    r'10-K|10-Q|8-K|20-F|6-K|DEF\s*14A|424B|S-1|F-1|Exhibit|Ex\.?\s*99|Note\s*\d|附注|年报|季报|中报|半年报|'
+    r'招股|公告|法院|判决|裁定|SEC|港交所|披露易|巨潮|FinMind|XBRL', re.I)
+_DERIVED_LABEL_RE = re.compile(r'(?<![A-Za-z])(?:PE|PB|PS|EV)(?![A-Za-z])|EV/|利润率|收益率|CAGR|IRR|增速|周转|稀释|隐含|折现|内在价值|安全边际')
+
+_STRATUM_NAME = {'derived': '派生', 'primary': '一手引用', 'random': '随机'}
+
+
+def _stratum(p: dict) -> str:
+    """派生指标（算出来的数）与带一手引用的数据点各成一层——纯随机几乎抽不到它们，
+    而实测出错的恰恰是这两类（稀释率错 20 倍、引错文件）。"""
+    if _DERIVED_LABEL_RE.search(p['label']) or _DERIVED_RE.search(p.get('raw_text', '')):
+        return 'derived'
+    if _PRIMARY_CITE_RE.search(p.get('raw_text', '')):
+        return 'primary'
+    return 'random'
+
+
+def sample_points(points: list, ratio: float = 0.15, seed: int = None,
+                  stratify: bool = True, min_derived: int = 2, min_primary: int = 2) -> list:
+    """随机抽取 ratio 比例的数据点，最少 3 个，最多 30 个。
+
+    stratify=True（默认）时分层：随机样本之外强制补足 min_derived 个派生指标点与
+    min_primary 个带一手引用的点。纯随机抽到的多是营收、净利这类最不容易错的表格数字。
+    """
+    for p in points:
+        p['stratum'] = _stratum(p)
     n = max(3, min(30, math.ceil(len(points) * ratio)))
     n = min(n, len(points))
     rng = Random(seed)
     sampled = rng.sample(points, n)
+    if stratify:
+        chosen = {p['id'] for p in sampled}
+        for stratum, need in (('derived', min_derived), ('primary', min_primary)):
+            have = sum(1 for p in sampled if p['stratum'] == stratum)
+            pool = [p for p in points if p['stratum'] == stratum and p['id'] not in chosen]
+            rng.shuffle(pool)
+            for p in pool[:max(0, need - have)]:
+                sampled.append(p)
+                chosen.add(p['id'])
     # 按行号排序，方便人工比对
     return sorted(sampled, key=lambda p: p['line_number'])
 
@@ -519,6 +575,15 @@ def _to_yi(num_str: str, unit: str) -> float:
     return v * _UNIT_TO_YI.get(unit or '', 1.0)
 
 
+# 行级排除：这些行里的"股价 / 净现金"不是对现值的陈述
+#   股价：加减仓阈值、历史低点、情景价位——是条件不是快照
+#   净现金：并列多口径、解释口径差异的行——口径问题交给 crosscheck 的口径标注处理，不在这里判冲突
+_FIELD_LINE_EXCLUDE = {
+    '股价': re.compile(r'加仓|减仓|买入|卖出|信号|低点|高点|历史|若|如果|跌|涨|回落|低于|高于|≤|≥|<|>|触发|情景|区间|锚|目标|临界'),
+    '净现金': re.compile(r'口径|狭义|广义|租赁|旧值|漏|扣除|剔除|再扣|含融资|须拆|其中'),
+}
+
+
 def collect_key_facts(files: list, fields=None) -> dict:
     """返回 {字段名: [ {file, line, raw, value, display} ... ]}。"""
     fields = fields or _KEY_FIELDS
@@ -539,6 +604,9 @@ def collect_key_facts(files: list, fields=None) -> dict:
             if _is_peer_table_row(line):
                 continue          # 横评表：一行里是多家公司的数，不是本公司的
             for name, pat, is_range, _tol in fields:
+                excl = _FIELD_LINE_EXCLUDE.get(name)
+                if excl is not None and excl.search(line):
+                    continue
                 matches = list(re.finditer(pat, line))
                 if name == '市值':
                     def _inside_paren(m):
@@ -633,6 +701,47 @@ def render_consistency(facts: dict, fields=None) -> dict:
 _DUAL_HEADING_RE = re.compile(r'^#{1,6}\s*.*双算.*$')
 _DUAL_SKIP_LABEL = {'指标', '项目', '名称', '口径'}
 
+# 指标字典：双算表里的指标名必须落到这些基名上，工具才能跨角色分组。
+# 各角色随手起名（"核心TTM EPS" / "TTM 核心 EPS" / "核心每股收益"）是双算永远配不上对的首要原因；
+# 字典外的指标只作信息展示，不参与打回判定。用 `crosscheck --list-metrics` 打印本表。
+_DUAL_CANON = {
+    '核心EPS':   ('核心TTMEPS', 'TTM核心EPS', '核心每股收益', '调整后EPS', 'NonGAAPEPS', 'Non-GAAPEPS'),
+    '核心PE':    ('TTM核心PE', '核心市盈率', '调整后PE', 'NonGAAPPE', 'Non-GAAPPE'),
+    '市值':      ('总市值', '市值验算', '当前市值'),
+    'FCF利润率': ('FCFmargin', '自由现金流利润率', 'FCF率', 'FCF/收入', 'FCF/营收'),
+    '隐含增速':  ('隐含增长率', '反向折现隐含增速', '现价隐含增速', '隐含年增速', '隐含CAGR'),
+    '稀释率':    ('稀释比例', '年稀释率', '股权稀释率'),
+    '净现金':    ('狭义净现金', '净现金头寸'),
+    '回购均价':  ('平均回购价', '回购平均价格'),
+    'TAC率':     ('TAC/总收入', 'TAC占比', 'TAC/收入'),
+    '份额变化':  ('市场份额变化', '份额增减', '份额变动'),
+    '收入增速':  ('营收增速', '收入同比', '营收同比'),
+    '分部利润率': ('分部经营利润率', '分部营业利润率'),
+    '单位经济':  ('UE', '单位经济指标', '单均利润'),
+}
+# 口径敏感指标：值不同但有人没标口径时，先判"口径未标"而不是"算错"
+_QUALIFIER_SENSITIVE = {'净现金', '市值', '核心EPS', '核心PE', '隐含增速', 'TAC率', '稀释率', '收入增速', '分部利润率'}
+
+
+def _canon_metric(base: str):
+    """把归一后的基名映射到字典基名；返回 (基名, 是否在字典内)。"""
+    low = base.replace(' ', '').lower()
+    for canon, aliases in _DUAL_CANON.items():
+        if low == canon.lower() or low in {a.lower() for a in aliases}:
+            return canon, True
+    for canon in _DUAL_CANON:           # "TTM核心PE" / "核心PE①" 这类带前缀的写法
+        if low.endswith(canon.lower()):
+            return canon, True
+    return base, False
+
+
+def list_dual_metrics():
+    print('双算复核表可用的指标名（基名；口径写在括号内，如「净现金(狭义)」）：')
+    for canon, aliases in _DUAL_CANON.items():
+        sens = '  ※口径敏感，必须带括号口径' if canon in _QUALIFIER_SENSITIVE else ''
+        print(f'  {canon:<10s} 别名：{"、".join(aliases)}{sens}')
+    print('字典外的指标可以写，但只作信息展示，不参与"打回"判定。')
+
 
 def _norm_metric(s: str) -> str:
     """指标名归一：去 markdown 记号与空白，全角括号转半角，便于跨文件匹配。"""
@@ -685,22 +794,23 @@ def collect_dual_calc(files: list) -> dict:
                 if not label or label in _DUAL_SKIP_LABEL:
                     continue
                 label, qualifier = _split_metric(label)
-                m = re.search(r'(' + _SIGN + r'[\d,，]+(?:\.\d+)?)\s*(万亿|亿|[BMT]|%|[xX]|倍)?', cells[1])
-                if not m:
-                    continue
-                val = _clean_num(m.group(1))
-                if val is None:
+                label, in_dict = _canon_metric(label)
+                nums = re.findall(r'(' + _SIGN + r'[\d,，]+(?:\.\d+)?)\s*(万亿|亿|[BMT]|%|[xX]|倍)?', cells[1])
+                vals = [(_clean_num(n), (u or '').lower().replace('倍', 'x')) for n, u in nums]
+                vals = [(v, u) for v, u in vals if v is not None]
+                if not vals:
                     continue
                 out.setdefault(label, []).append({
                     'file': os.path.basename(path), 'line': j,
-                    'value': val, 'unit': (m.group(2) or '').lower().replace('倍', 'x'),
-                    'qualifier': qualifier,
+                    'value': vals[0][0], 'unit': vals[0][1],
+                    'alt_values': [v for v, _ in vals[1:]],      # 同格并列的其他口径值
+                    'qualifier': qualifier, 'in_dict': in_dict,
                     'formula': cells[2] if len(cells) > 2 else '',
                 })
     return out
 
 
-def render_crosscheck(dual: dict, required=None, tol: float = 0.01) -> dict:
+def render_crosscheck(dual: dict, required=None, tol: float = 0.01, verbose: bool = False) -> dict:
     BOLD, RED, GREEN, YELLOW, RESET = '\033[1m', '\033[91m', '\033[92m', '\033[93m', '\033[0m'
     print('=' * 70)
     print(f'{BOLD}双算复核 — 关键派生指标是否被两个角色各算一次{RESET}')
@@ -718,7 +828,7 @@ def render_crosscheck(dual: dict, required=None, tol: float = 0.01) -> dict:
         print('=' * 70)
         return {'agreed': [], 'mismatch': [], 'single': [], 'missing': list(required or [])}
 
-    mismatch, single, agreed, qual_diff = [], [], [], []
+    mismatch, single, agreed, qual_diff, unqualified = [], [], [], [], []
     for metric, hits in sorted(dual.items()):
         files = {h['file'] for h in hits}
         vals = [h['value'] for h in hits]
@@ -728,6 +838,16 @@ def render_crosscheck(dual: dict, required=None, tol: float = 0.01) -> dict:
             continue
         lo, hi = min(vals), max(vals)
         spread = abs(hi - lo) / abs(lo) if lo else (0.0 if hi == 0 else float('inf'))
+        # 单元格并列多值（如"28.8x / 29.6x"两种剔法）：任一并列值与他人主值在容差内即视为一致
+        if spread > tol:
+            cands = [[h['value']] + h.get('alt_values', []) for h in hits]
+            import itertools
+            for combo in itertools.product(*cands):
+                c_lo, c_hi = min(combo), max(combo)
+                c_sp = abs(c_hi - c_lo) / abs(c_lo) if c_lo else float('inf')
+                if c_sp <= tol:
+                    spread = c_sp
+                    break
         quals = {h.get('qualifier', '') for h in hits}
         if len(units) > 1 or spread > tol:
             if len(quals) > 1 and spread > tol:
@@ -736,6 +856,13 @@ def render_crosscheck(dual: dict, required=None, tol: float = 0.01) -> dict:
                 for h in sorted(hits, key=lambda x: (x['file'], x['line'])):
                     print(f'       {h["file"]}:{h["line"]:<4d} {h["value"]}{h["unit"]:<4s} [{h.get("qualifier") or "—"}] | {h["formula"][:44]}')
                 qual_diff.append({'metric': metric, 'hits': hits})
+                continue
+            if metric in _QUALIFIER_SENSITIVE and '' in quals and spread > tol:
+                # 口径敏感指标有人没标口径（"净现金 572 亿" vs "净现金 1,414 亿"）：先补口径再判，不当算错
+                print(f'  {YELLOW}?{RESET} {metric:<22s} 口径未标——该指标口径敏感，值不同但有角色未在括号内写口径，补齐后再判')
+                for h in sorted(hits, key=lambda x: (x['file'], x['line'])):
+                    print(f'       {h["file"]}:{h["line"]:<4d} {h["value"]}{h["unit"]:<4s} [{h.get("qualifier") or "未标口径"}] | {h["formula"][:44]}')
+                unqualified.append({'metric': metric, 'hits': hits})
                 continue
             reason = '单位不一致' if len(units) > 1 else f'偏差 {spread * 100:.1f}% > {tol * 100:.0f}%'
             print(f'  {RED}✗{RESET} {metric:<22s} {reason}')
@@ -750,20 +877,30 @@ def render_crosscheck(dual: dict, required=None, tol: float = 0.01) -> dict:
     if required:
         have = {m for m, h in dual.items() if len({x['file'] for x in h}) >= 2}
         for req in required:
-            key = _norm_metric(req)
-            if not any(key in m or m in key for m in have):
+            key, _ = _canon_metric(_norm_metric(req))
+            if key not in have and not any(key in m or m in key for m in have):
                 missing.append(req)
 
-    if single:
+    single_dict = [(m, h) for m, h in single if h[0].get('in_dict')]
+    single_other = [(m, h) for m, h in single if not h[0].get('in_dict')]
+    if single_dict:
         print()
-        print(f'  {YELLOW}只有一个角色算过（未构成双算）：{RESET}')
-        for metric, hits in single:
+        print(f'  {YELLOW}字典内指标只有一个角色算过（未构成双算，应补算）：{RESET}')
+        for metric, hits in single_dict:
             print(f'       {metric}  =  {hits[0]["value"]}{hits[0]["unit"]}   （仅 {hits[0]["file"]}）')
+    if single_other:
+        print()
+        if verbose:
+            print(f'  字典外指标（{len(single_other)} 个，仅信息，不参与判定）：')
+            for metric, hits in single_other:
+                print(f'       {metric}  =  {hits[0]["value"]}{hits[0]["unit"]}   （仅 {hits[0]["file"]}）')
+        else:
+            print(f'  另有 {len(single_other)} 个字典外指标仅单算（正常；加 --verbose 查看）')
 
     print('-' * 70)
     print(f'  双算一致: {GREEN}{len(agreed)}{RESET}  |  不一致: {RED}{len(mismatch)}{RESET}  '
-          f'|  口径不同: {YELLOW}{len(qual_diff)}{RESET}  |  仅单算: {YELLOW}{len(single)}{RESET}  '
-          f'|  必算项缺失: {RED}{len(missing)}{RESET}')
+          f'|  口径不同: {YELLOW}{len(qual_diff)}{RESET}  |  口径未标: {YELLOW}{len(unqualified)}{RESET}  '
+          f'|  字典内单算: {YELLOW}{len(single_dict)}{RESET}  |  必算项缺失: {RED}{len(missing)}{RESET}')
     if missing:
         print(f'  {RED}以下必算指标没有被两个角色各算一次：{RESET}{"、".join(missing)}')
     if mismatch or missing:
@@ -772,6 +909,7 @@ def render_crosscheck(dual: dict, required=None, tol: float = 0.01) -> dict:
         print(f'{BOLD}{GREEN}【通过】双算指标全部一致。{RESET}')
     print('=' * 70)
     return {'agreed': agreed, 'mismatch': mismatch, 'qualifier_diff': [q['metric'] for q in qual_diff],
+            'unqualified': [u['metric'] for u in unqualified],
             'single': [m for m, _ in single], 'missing': missing}
 
 
@@ -789,6 +927,13 @@ def render_crosscheck(dual: dict, required=None, tol: float = 0.01) -> dict:
 _EVIDENCE_HEADING_RE = re.compile(r'^#{1,6}\s*.*抽查.*$')
 _VERDICT_RE = re.compile(r'(证实|证伪|核不到|无法核实|未能核实|不成立|成立|不属实|属实|有误|核实为真|为真|不符|矛盾|吻合|确认|相符|两值都对|都对|核实|数值正确|正确|一致|冲突|已更新|需更新|需订正|已订正)')
 _EVID_SKIP_LABEL = {'底稿条目', '条目', '项目', '数据项'}
+# 否定结论必须先于肯定词匹配："一手无法证实"含"证实"二字，不先拦会被记成证实
+_VERDICT_NEG_RE = re.compile(r'无法证实|未能证实|不能证实|无法核实|未能核实|核不到|未见一手|未找到|查不到|无一手|无法取得|取不到')
+# 一手来源列必须指向具体文件/URL："在 10-Q 里见过"不算，"10-Q 2025-12-31 Note 1（URL）"才算
+_SPECIFIC_SRC_RE = re.compile(
+    r'https?://|www\.|\.pdf|\.htm|10-K|10-Q|8-K|20-F|6-K|DEF\s*14A|424B|S-1|F-1|Exhibit|Ex\.?\s*99|Note\s*\d|'
+    r'附注|年报|季报|中报|半年报|招股|公告|判决|裁定|法院|意见书|新闻稿|电话会|转录|transcript|投资者关系|'
+    r'港交所|披露易|巨潮|FinMind|XBRL|财报|10-K/A|S-4|Form\s*\d', re.I)
 
 
 def collect_evidence(files: list) -> list:
@@ -802,6 +947,8 @@ def collect_evidence(files: list) -> list:
             joined = ' '.join(cells)
             m = _VERDICT_RE.search(joined)
             verdict = m.group(1) if m else '未标注'
+            if _VERDICT_NEG_RE.search(' '.join(cells[3:]) if len(cells) > 3 else joined):
+                verdict = '核不到'
             verdict = {'无法核实': '核不到', '未能核实': '核不到',
                        '成立': '证实', '属实': '证实', '核实为真': '证实', '为真': '证实',
                        '吻合': '证实', '确认': '证实', '相符': '证实', '两值都对': '证实', '都对': '证实', '核实': '证实',
@@ -843,25 +990,35 @@ def render_evidence(rows: list, out_path: str = None, company: str = '') -> dict
         print('=' * 70)
         return {'rows': [], 'confirmed': 0, 'refuted': 0, 'unverifiable': 0, 'incomplete': []}
 
-    buckets = {'证实': [], '证伪': [], '核不到': [], '未标注': []}
+    # "证实"必须同时有具体一手来源与核验日期，否则降为"证实(凭据不全)"，按规则不得升 ✅
+    for r in rows:
+        if r['verdict'] == '证实':
+            src_ok = bool(r['source'].strip()) and _SPECIFIC_SRC_RE.search(r['source']) is not None
+            if not src_ok or not r['date']:
+                r['verdict'] = '证实(凭据不全)'
+                r['why'] = '来源不具体或为空' if not src_ok else '缺核验日期'
+    buckets = {'证实': [], '证实(凭据不全)': [], '证伪': [], '核不到': [], '未标注': []}
     for r in rows:
         buckets[r['verdict']].append(r)
-    incomplete = [r for r in rows if r['verdict'] == '证实' and (not r['source'] or not r['date'])]
+    incomplete = buckets['证实(凭据不全)']
 
     for v, mark, color in (('证伪', '✗', RED), ('核不到', '○', YELLOW),
-                           ('证实', '✓', GREEN), ('未标注', '?', YELLOW)):
+                           ('证实', '✓', GREEN), ('证实(凭据不全)', '△', YELLOW), ('未标注', '?', YELLOW)):
         if not buckets[v]:
             continue
         print(f'  {color}{mark} {v}（{len(buckets[v])} 条）{RESET}')
         for r in buckets[v]:
-            print(f'       {r["file"]}:{r["line"]:<4d} {r["item"][:26]:<26s} {r["source"][:34]}')
+            why = f'  ← {r["why"]}' if r.get('why') else ''
+            print(f'       {r["file"]}:{r["line"]:<4d} {r["item"][:26]:<26s} {r["source"][:34]}{why}')
     print('-' * 70)
     print(f'  抽查 {len(rows)} 条  |  证实 {GREEN}{len(buckets["证实"])}{RESET}  '
+          f'|  凭据不全 {YELLOW}{len(incomplete)}{RESET}  '
           f'|  证伪 {RED}{len(buckets["证伪"])}{RESET}  |  核不到 {YELLOW}{len(buckets["核不到"])}{RESET}')
     if buckets['证伪']:
         print(f'  {RED}证伪项必须回写底稿并订正引用它的报告，否则下一轮继续错。{RESET}')
     if incomplete:
-        print(f'  {YELLOW}{len(incomplete)} 条标"证实"但缺一手来源或核验日期 → 按规则不得升为 ✅。{RESET}')
+        print(f'  {YELLOW}{len(incomplete)} 条标"证实"但来源不具体或缺核验日期 → 保持 ⚠️，不得升 ✅；'
+              f'"在 10-Q 里见过"不是来源，要写文件名/URL + 附注号。{RESET}')
 
     if out_path:
         lines = [f'# {company or ""} 证据台账'.strip(), '',
@@ -869,15 +1026,18 @@ def render_evidence(rows: list, out_path: str = None, company: str = '') -> dict
                  f'生成于 {date_mod.today().isoformat()}。',
                  '> 用途：底稿条目 ⚠️→✅ 的升级凭据（须同时有一手来源与核验日期）；证伪项须回写底稿。', '',
                  '| 结论 | 底稿条目 | 原值 | 一手来源 | 核验日期 | 出处 |', '|---|---|---|---|---|---|']
-        for v in ('证伪', '核不到', '证实', '未标注'):
+        for v in ('证伪', '核不到', '证实', '证实(凭据不全)', '未标注'):
             for r in buckets[v]:
-                lines.append(f'| {v} | {r["item"]} | {r["old_value"]} | {r["source"]} | '
+                tag = f'{v}·{r["why"]}' if r.get('why') else v
+                lines.append(f'| {tag} | {r["item"]} | {r["old_value"]} | {r["source"]} | '
                              f'{r["date"] or "—"} | {r["file"]}:{r["line"]} |')
         lines += ['', f'**合计**：抽查 {len(rows)} 条 — 证实 {len(buckets["证实"])}、'
+                      f'证实但凭据不全 {len(incomplete)}、'
                       f'证伪 {len(buckets["证伪"])}、核不到 {len(buckets["核不到"])}、'
                       f'未标注 {len(buckets["未标注"])}。']
         if incomplete:
-            lines.append(f'**{len(incomplete)} 条标"证实"但凭据不全**（缺一手来源或核验日期），按规则保持 ⚠️。')
+            lines.append(f'**{len(incomplete)} 条标"证实"但凭据不全**（来源不具体 / 缺核验日期），按规则保持 ⚠️，'
+                         f'不得升 ✅。')
         with open(out_path, 'w', encoding='utf-8') as f:
             f.write('\n'.join(lines) + '\n')
         print(f'  台账已写入 {out_path}')
@@ -898,13 +1058,16 @@ _LINT_RULES = [
      lambda l: any(len(t) > 5 or ('☆' in t and len(t) != 5) for t in re.findall(r'[★☆]{2,}', l))),
     ('SUBJECTIVE', 'FAIL', '主观表述（我认为/我觉得/显然）',
      lambda l: (not l.lstrip().startswith('>')) and re.search(r'我认为|我觉得|显然', l) is not None),
-    ('GUIDANCE-NO-DATE', 'WARN', '指引类数字未标注日期/来源事件',
-     lambda l: ('指引' in l and re.search(r'\d', l) is not None
-                and re.search(r'20\d\d|截至|财报|电话会|上调|下调', l) is None)),
+    ('GUIDANCE-NO-DATE', 'WARN', '指引类数字未标注日期/来源事件（可写"同上 / 见底稿 §N"指向底稿里的日期）',
+     lambda l: (_GUIDE_NUM_RE.search(l) is not None and _GUIDE_REF_RE.search(l) is None)),
     ('UNIT-SLIP', 'WARN', '同一行两个"亿"数值呈 10× / 100× 关系，疑似单位错位',
      lambda l: _unit_slip(l)),
 ]
 
+
+# "指引"后 40 字内出现带单位的数字才算指引数字；"分部、指引、一致预期"这类罗列名词不算
+_GUIDE_NUM_RE = re.compile(r'指引[^\n|]{0,40}?' + _SIGN + r'\d[\d,，\.]*\s*(?:%|亿|万亿|[BMT](?![A-Za-z])|[–\-~～]\s*\d)')
+_GUIDE_REF_RE = re.compile(r'20\d\d|截至|财报|电话会|上调|下调|同上|底稿|§|发布|指引日|新闻稿|8-K|（估计）|\(估计\)|估计值')
 
 _DERIVED_RE = re.compile(
     r'稀释(?:率|约|了|比例)|稀释\s*[\d.]|核心\s*EPS|核心\s*PE|CAGR|IRR|隐含增速|'
@@ -992,6 +1155,65 @@ def lint_files(files: list) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# 上轮复核记录 → 本轮抽查清单
+#
+# skill 规定"team-lead 复核记录的每一项自动进入下一轮底稿抽查清单"，但此前没有任何
+# 机制读它。本命令把最终报告的「复核记录」表抽出来，按"上轮有没有填依据"排优先级，
+# 输出可直接贴进 00-数据底稿.md 的表格。复核者自己也会错（实测把正确的 847.5 亿
+# "订正"成 800 亿），所以上轮每一处订正都要在本轮被不同的人独立核一次。
+# ---------------------------------------------------------------------------
+
+_REVIEW_HEADING_RE = re.compile(r'^#{1,6}\s*.*复核记录.*$')
+_EMPTY_CELL = {'', '—', '-', '无', '无需', 'n/a', 'N/A'}
+
+
+def collect_review_items(path: str) -> list:
+    rows = []
+    for line, cells in _tables_under(path, _REVIEW_HEADING_RE):
+        head = re.sub(r'[\*_`~]+', '', cells[0]).strip()
+        if head in ('#', '序号', '编号', '事项') or re.fullmatch(r'[\s\-:]+', head):
+            continue
+        # 有编号列时事项在第 2 列，否则在第 1 列
+        off = 1 if re.fullmatch(r'\d+', head) else 0
+        get = lambda k: (cells[k + off].strip() if len(cells) > k + off else '')
+        item, handling, basis, date = get(0), get(1), get(2), get(3)
+        if not item:
+            continue
+        has_basis = basis not in _EMPTY_CELL and not re.fullmatch(r'[\s\-—]*', basis)
+        if not re.search(r'20\d\d[-/]\d{1,2}', date):
+            date = ''
+        rows.append({'line': line, 'item': item, 'handling': handling, 'basis': basis,
+                     'date': date, 'has_basis': has_basis})
+    return rows
+
+
+def render_review_items(rows: list, report: str, out_path: str = None) -> dict:
+    lines = ['## 上轮 team-lead 复核记录 → 本轮底稿抽查清单', '',
+             f'> 来源：`{report}` 的「复核记录」表。规则：上轮每一处订正都要在本轮被**不同角色**独立核一次；'
+             f'上轮没填依据或没填核验日期的项优先级为高。',
+             '', '| # | 事项 | 上轮处理 | 上轮依据 | 上轮核验日期 | 本轮优先级 | 本轮抽查人 | 本轮结论 |',
+             '|---|---|---|---|---|---|---|---|']
+    high = 0
+    for i, r in enumerate(rows, start=1):
+        if not r['has_basis'] or not r['date']:
+            prio = '**高**（上轮' + ('未填依据' if not r['has_basis'] else '未填核验日期') + '）'
+            high += 1
+        else:
+            prio = '普通'
+        lines.append(f'| {i} | {r["item"]} | {r["handling"]} | {r["basis"] or "—"} | {r["date"] or "—"} | {prio} |  |  |')
+    if not rows:
+        lines.append('| — | （未在报告中找到「复核记录」表） |  |  |  |  |  |  |')
+    lines += ['', f'共 {len(rows)} 项，其中 {high} 项上轮凭据不全须优先核。']
+    text = '\n'.join(lines)
+    print(text)
+    if out_path:
+        with open(out_path, 'a', encoding='utf-8') as f:
+            f.write('\n' + text + '\n')
+        print(f'\n已追加写入 {out_path}', file=sys.stderr)
+    return {'items': rows, 'high_priority': high}
+
+
+# ---------------------------------------------------------------------------
 # CLI Entry Point
 # ---------------------------------------------------------------------------
 
@@ -1050,6 +1272,12 @@ def main():
 
   格式与纪律 lint（半星 / 主观表述 / 无日期指引 / 单位错位 / 派生指标无算式）：
     python3 tools/report_audit.py lint reports/腾讯/0*.md
+
+  上轮复核记录 → 本轮抽查清单（新一轮研究做底稿时先跑，贴进 00-数据底稿.md）：
+    python3 tools/report_audit.py review-items --report reports/腾讯/最终报告.md
+
+  双算表允许的指标名（各角色必须用字典名，否则配不上对）：
+    python3 tools/report_audit.py crosscheck --list-metrics
         """)
 
     sub = parser.add_subparsers(dest='command')
@@ -1060,6 +1288,7 @@ def main():
     ext.add_argument('--ratio', type=float, default=0.15, help='抽样比例，默认 0.15')
     ext.add_argument('--seed', type=int, default=None, help='随机种子（可选，用于复现）')
     ext.add_argument('--dry-run', action='store_true', help='只打印，不输出 JSON')
+    ext.add_argument('--no-stratify', action='store_true', help='关闭分层（默认强制补 2 个派生指标 + 2 条一手引用）')
 
     # verdict
     vrd = sub.add_parser('verdict', help='根据核验结果输出准出/打回判决')
@@ -1079,6 +1308,8 @@ def main():
     cc.add_argument('files', nargs='*', help='或直接列出文件')
     cc.add_argument('--require', default='', help='必算指标，逗号分隔（缺一即打回）')
     cc.add_argument('--tolerance', type=float, default=0.01, help='容差，默认 1%%')
+    cc.add_argument('--verbose', action='store_true', help='列出字典外的单算指标')
+    cc.add_argument('--list-metrics', action='store_true', help='打印双算指标字典后退出')
     cc.add_argument('--output-json', action='store_true')
 
     # evidence
@@ -1094,7 +1325,17 @@ def main():
     lnt.add_argument('files', nargs='+', help='报告文件（可多个）')
     lnt.add_argument('--output-json', action='store_true')
 
+    # review-items
+    rv = sub.add_parser('review-items', help='把上轮最终报告的「复核记录」转成本轮底稿抽查清单')
+    rv.add_argument('--report', required=True, help='上轮最终报告路径')
+    rv.add_argument('--out', help='追加写入的文件（通常是本轮 00-数据底稿.md）')
+    rv.add_argument('--output-json', action='store_true')
+
     args = parser.parse_args()
+
+    if args.command == 'crosscheck' and args.list_metrics:
+        list_dual_metrics()
+        sys.exit(0)
 
     if args.command == 'consistency':
         files = list(args.files or [])
@@ -1127,7 +1368,7 @@ def main():
             print('❌ 没有可检查的文件', file=sys.stderr)
             sys.exit(1)
         req = [x.strip() for x in args.require.split(',') if x.strip()]
-        outcome = render_crosscheck(collect_dual_calc(files), req, args.tolerance)
+        outcome = render_crosscheck(collect_dual_calc(files), req, args.tolerance, verbose=args.verbose)
         if args.output_json:
             print(json.dumps(outcome, ensure_ascii=False, indent=2))
         sys.exit(1 if (outcome['mismatch'] or outcome['missing']) else 0)
@@ -1156,6 +1397,15 @@ def main():
             print(json.dumps(outcome, ensure_ascii=False, indent=2))
         sys.exit(1 if outcome['fails'] else 0)
 
+    elif args.command == 'review-items':
+        if not os.path.exists(args.report):
+            print(f'❌ 文件不存在: {args.report}', file=sys.stderr)
+            sys.exit(1)
+        outcome = render_review_items(collect_review_items(args.report), args.report, args.out)
+        if args.output_json:
+            print(json.dumps(outcome, ensure_ascii=False, indent=2))
+        sys.exit(0)
+
     elif args.command == 'extract':
         if not os.path.exists(args.report):
             print(f'❌ 文件不存在: {args.report}', file=sys.stderr)
@@ -1165,7 +1415,7 @@ def main():
             text = f.read()
 
         all_points = extract_data_points(text)
-        sampled = sample_points(all_points, ratio=args.ratio, seed=args.seed)
+        sampled = sample_points(all_points, ratio=args.ratio, seed=args.seed, stratify=not args.no_stratify)
 
         print('=' * 70)
         print(f'报告数据抽检清单')
@@ -1175,10 +1425,15 @@ def main():
             print(f'随机种子：{args.seed}（可用于复现同一批样本）')
         print('=' * 70)
         print()
-        print(f'{"ID":>3}  {"行号":>5}  {"数据标签":<35}  {"报告值":>12}  {"单位"}')
-        print(f'{"─"*3}  {"─"*5}  {"─"*35}  {"─"*12}  {"─"*6}')
+        strata = {k: sum(1 for p in sampled if p.get('stratum') == k) for k in _STRATUM_NAME}
+        print('分层：' + '  '.join(f'{_STRATUM_NAME[k]} {v}' for k, v in strata.items())
+              + ('' if args.no_stratify else '  （派生指标与一手引用各至少 2 个，随机之外强制补足）'))
+        print()
+        print(f'{"ID":>3}  {"行号":>5}  {"层":<6}  {"数据标签":<35}  {"报告值":>12}  {"单位"}')
+        print(f'{"─"*3}  {"─"*5}  {"─"*6}  {"─"*35}  {"─"*12}  {"─"*6}')
         for p in sampled:
-            print(f'{p["id"]:>3}  {p["line_number"]:>5}  {p["label"][:35]:<35}  {p["reported_value"]:>12.2f}  {p["unit"]}')
+            print(f'{p["id"]:>3}  {p["line_number"]:>5}  {_STRATUM_NAME.get(p.get("stratum"), ""):<6}  '
+                  f'{p["label"][:35]:<35}  {p["reported_value"]:>12.2f}  {p["unit"]}')
         print()
         print('↑ 请对上述每个数据点，从以下信源取数，填入 fetched_value：')
         print('  美股：macrotrends.net（主）+ stockanalysis.com（副）')
@@ -1197,6 +1452,7 @@ def main():
                     'unit': p['unit'],
                     'line_number': p['line_number'],
                     'raw_text': p['raw_text'],
+                    'stratum': p.get('stratum', 'random'),
                     'fetched_value': None,       # ← 填入主来源核验值
                     'fetched_source': '',        # ← 填入主来源名称
                     'fetched_value2': None,      # ← 填入副来源核验值（可选）
