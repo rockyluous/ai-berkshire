@@ -193,7 +193,8 @@
   ],
   "skip_files": [
     "README.md",
-    "command-log.jsonl"
+    "command-log.jsonl",
+    "00-证据台账.md"
   ],
   "tickers": {}
 }

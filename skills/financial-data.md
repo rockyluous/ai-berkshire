@@ -22,6 +22,9 @@ python3 tools/usstock_data.py financials GOOGL --cik 1652044  # 近5财年：营
 python3 tools/usstock_data.py quarterly GOOGL --cik 1652044   # 近8季（现金流 YTD 已差分成单季，Q4 由年度−9M 推算并标 *）
 python3 tools/usstock_data.py valuation GOOGL --cik 1652044   # PE(TTM)/PB/PS/FCF收益率/净现金 + 核心PE估计
 python3 tools/usstock_data.py search alphabet                 # 查 CIK（需声明式 UA，见下）
+python3 tools/usstock_data.py datasheet GOOGL --cik 1652044 --price 349.39 \
+    --as-of 2026-09-14 --out reports/Google/00-数据底稿.json   # 机器可读底稿（带 as_of/fetched_at）
+python3 tools/usstock_data.py datasheet --check reports/Google/00-数据底稿.json  # 新鲜度体检，决定要不要重取
 任何子命令加 --json → 机器可读，供数据底稿直接引用
 ```
 
@@ -31,6 +34,8 @@ python3 tools/usstock_data.py search alphabet                 # 查 CIK（需声
 2. 工具会在近 4 季非经营损益占经营利润 >15% 时报警——此时 GAAP PE 无意义，用工具给出的核心 PE 估计或自行剔除后再算
 3. 交叉验证：工具值（一手）与 stockanalysis 对照；macrotrends 对自动化访问经常 403，不再作为必需来源
 4. 多类别股票（GOOGL/GOOG、BRK）的封面页股数 XBRL 不给，工具退回最新季度稀释加权平均股数并注明；做市值验算时按公司 IR 披露的三类合计再核一次
+5. **取数集中、核验分散**：结构化财务数据（本工具能取的）全队只取一次、写进底稿共用；法院文书、proxy 条款、管理层言论这类需要领域判断的，各角色分别去查——把核验也集中了，就再没有独立交叉验证，底稿的错会被所有报告同时继承
+6. SEC 响应缓存在 `local/sec_cache/`（财务数据 24 小时、代码表 7 天，`local/` 不入库）。跨轮研究先跑 `datasheet --check` 判断能否直接复用，别习惯性重取
 
 ### 港股（腾讯0700、网易9999、美团3690等）
 

@@ -13,7 +13,7 @@
          main() 中 print(json.dumps(...)) 遇到 €/→/★ 等字符抛
          UnicodeEncodeError 直接退出。
 
-另覆盖 consistency / lint 子命令与抽样器对评分行的排除。
+另覆盖 consistency / crosscheck / evidence / lint 子命令与抽样器对评分行的排除。
 
 Zero external dependencies — 仅用 unittest，与 report_audit.py 本身保持一致。
 运行：  python tests/test_report_audit.py
@@ -321,6 +321,142 @@ class TestLint(unittest.TestCase):
     def test_unit_slip_warns(self):
         out = self._lint('核心净利润 $138.28亿 ≈ $1,382.8亿\n')
         self.assertTrue(any(w['code'] == 'UNIT-SLIP' for w in out['warns']))
+
+
+
+class TestCrosscheck(unittest.TestCase):
+    """双算复核：consistency 与 lint 都发现不了"一份报告自己算错"，靠两个角色独立重算。
+
+    夹具复刻真实事故：优先股稀释率漏除存托股 1/20，被算成 7.78%（实为 0.39%）。
+    """
+
+    FIN = ("# 02\n\n## 双算复核表\n\n"
+           "| 指标 | 本报告值 | 算式 |\n|---|---|---|\n"
+           "| 核心TTM EPS | 10.11 | financial_rigor calc |\n"
+           "| 优先股稀释率 | 7.78% | 3.35亿 × 2.842 ÷ 122.3亿 |\n"
+           "| 核心PE | 34.56 | verify-valuation |\n")
+    RISK = ("# 04\n\n## 双算复核表\n\n"
+            "| 指标 | 本报告值 | 算式 |\n|---|---|---|\n"
+            "| 优先股稀释率 | 0.39% | financial_rigor calc '335e6/20*2.842/12.23e9*100' |\n"
+            "| 核心PE | 34.60 | 独立复算 |\n")
+
+    def _run(self, required=None):
+        import tempfile, contextlib
+        with tempfile.TemporaryDirectory() as d:
+            for name, body in (('02-fin.md', self.FIN), ('04-risk.md', self.RISK)):
+                with open(os.path.join(d, name), 'w', encoding='utf-8') as fh:
+                    fh.write(body)
+            files = [os.path.join(d, n) for n in ('02-fin.md', '04-risk.md')]
+            dual = R.collect_dual_calc(files)
+            with contextlib.redirect_stdout(io.StringIO()):
+                return dual, R.render_crosscheck(dual, required or [])
+
+    def test_extracts_table(self):
+        dual, _ = self._run()
+        self.assertIn('核心PE', dual)
+        self.assertEqual(len(dual['优先股稀释率']), 2)
+
+    def test_twentyfold_error_detected(self):
+        _, out = self._run()
+        self.assertEqual([m['metric'] for m in out['mismatch']], ['优先股稀释率'])
+
+    def test_agreement_passes(self):
+        _, out = self._run()
+        self.assertIn('核心PE', out['agreed'])
+
+    def test_single_calc_reported_not_failed(self):
+        _, out = self._run()
+        self.assertIn('核心TTMEPS', out['single'])
+
+    def test_no_dual_tables_is_not_reported_as_pass(self):
+        import contextlib
+        with contextlib.redirect_stdout(io.StringIO()) as buf:
+            out = R.render_crosscheck({}, ['核心EPS'])
+        self.assertEqual(out['missing'], ['核心EPS'])
+        self.assertIn('未找到任何', buf.getvalue())
+        self.assertNotIn('【通过】', buf.getvalue())
+
+    def test_required_metric_missing_is_flagged(self):
+        _, out = self._run(required=['核心PE', '隐含增速'])
+        self.assertEqual(out['missing'], ['隐含增速'])
+
+
+class TestFileLevelLint(unittest.TestCase):
+    """派生指标必须留下工具验算痕迹（禁止心算）。"""
+
+    def _lint(self, text):
+        import tempfile, contextlib
+        with tempfile.NamedTemporaryFile('w', suffix='.md', delete=False, encoding='utf-8') as fh:
+            fh.write(text)
+            path = fh.name
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                return R.lint_files([path])
+        finally:
+            os.unlink(path)
+
+    def test_warns_without_tool_trace(self):
+        out = self._lint('核心EPS 为 10.11，稀释率 0.39%，隐含增速 20.8%\n')
+        self.assertIn('DERIVED-NO-CALC', {w['code'] for w in out['warns']})
+
+    def test_silent_with_tool_trace(self):
+        out = self._lint('核心EPS 为 10.11，稀释率 0.39%\n\n'
+                         '```\npython3 tools/financial_rigor.py calc --expr ...\n```\n')
+        self.assertNotIn('DERIVED-NO-CALC', {w['code'] for w in out['warns']})
+
+    def test_silent_for_thesis_citing_source_report(self):
+        """论文文件承接研究报告的结论，不是自己心算，不应报警。"""
+        out = self._lint('> 来源：/investment-team 研究，见 最终报告.md\n'
+                         '核心EPS $10.11、核心PE 34.6x、隐含增速 20.8%\n')
+        self.assertNotIn('DERIVED-NO-CALC', {w['code'] for w in out['warns']})
+
+    def test_silent_when_few_derived_metrics(self):
+        out = self._lint('本季营收 1,198 亿，同比 +24%\n')
+        self.assertNotIn('DERIVED-NO-CALC', {w['code'] for w in out['warns']})
+
+
+
+class TestEvidenceLedger(unittest.TestCase):
+    """证据台账：汇总各视角的底稿抽查，作为 ⚠️→✅ 的升级凭据。"""
+
+    MD = ("# 04\n\n## 底稿抽查表\n\n"
+          "| 底稿条目 | 原值 | 一手来源 | 核验日期 | 结论 |\n|---|---|---|---|---|\n"
+          "| 股权融资规模 | $800 亿 | SEC FWP 2026-06-02 定价清单 | 2026-09-15 | 证伪（新值：$847.5 亿） |\n"
+          "| 创始人投票权 | 52.7% | DEF 14A 2026-04-24 第35页 | 2026-09-15 | 证实 |\n"
+          "| AI Capex 承诺 | $8,110 亿 | 10-Q Commitments | 2026-09-15 | 核不到 |\n"
+          "| 折旧影响 | $39 亿 | FY2023 10-K 附注 |  | 证实 |\n")
+
+    def _run(self):
+        import tempfile, contextlib
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, '04-risk.md')
+            with open(path, 'w', encoding='utf-8') as fh:
+                fh.write(self.MD)
+            rows = R.collect_evidence([path])
+            with contextlib.redirect_stdout(io.StringIO()):
+                return rows, R.render_evidence(rows)
+
+    def test_verdicts_bucketed(self):
+        _, out = self._run()
+        self.assertEqual((out['confirmed'], out['refuted'], out['unverifiable']), (2, 1, 1))
+
+    def test_check_date_not_taken_from_source_column(self):
+        """来源列里的文件日期不能被当成核验日期。"""
+        rows, _ = self._run()
+        by = {r['item']: r for r in rows}
+        self.assertEqual(by['股权融资规模']['date'], '2026-09-15')
+        self.assertEqual(by['创始人投票权']['date'], '2026-04-24' if False else '2026-09-15')
+
+    def test_confirmed_without_date_flagged_incomplete(self):
+        _, out = self._run()
+        self.assertEqual([r['item'] for r in out['incomplete']], ['折旧影响'])
+
+    def test_empty_is_not_silent(self):
+        import contextlib
+        with contextlib.redirect_stdout(io.StringIO()) as buf:
+            out = R.render_evidence([])
+        self.assertEqual(out['refuted'], 0)
+        self.assertIn('未找到任何', buf.getvalue())
 
 
 if __name__ == '__main__':

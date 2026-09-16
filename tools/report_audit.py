@@ -28,6 +28,7 @@ import os
 import re
 import sys
 from decimal import Decimal, Context, ROUND_HALF_EVEN
+from datetime import date as date_mod
 from random import Random
 
 _CTX = Context(prec=28, rounding=ROUND_HALF_EVEN)
@@ -463,14 +464,14 @@ _KEY_FIELDS = [
      True, 0.01),
     # 现价：排除"目标/隐含/情景"股价，排除后接货币单位（那是市值）和"左右/分歧"（那是价差描述）
     ('股价',
-     r'(?<!目标)(?<!隐含)(?<!情景)(?<!转)(?<!触发)(?<!上限)(?<!下限)股价(?![^\d\n]{0,25}(?:目标|分歧|价差|、))[^\d\n]{0,25}\$\s*' + _NUM + r'()(?![\d\.])(?![,，]\d)(?!\s*[万亿BT])(?!\s*左右)',
+     r'(?<!目标)(?<!隐含)(?<!情景)(?<!转)(?<!触发)(?<!上限)(?<!下限)股价(?![^\d\n]{0,25}(?:目标|分歧|价差|、|区间|最低|最高|日线|年内))[^\d\n]{0,25}\$\s*' + _NUM + r'()(?![\d\.])(?![,，]\d)(?!\s*[万亿BT])(?!\s*左右)',
      False, 0.02),
     ('总股本',
      r'总股本(?![^\d\n]{0,20}、)[^\d\n]{0,20}' + _NUM + r'\s*(亿|B)',
      False, 0.01),
     # 市值：排除"蒸发/缩水/增减"等变动量描述
     ('市值',
-     r'(?<!回购)(?<!回购总)(?<!回购的)市值(?![^\d\n]{0,20}(?:蒸发|缩水|损失|增|减|变|、))[^\d\n]{0,20}\$?\s*' + _NUM + r'\s*(万亿|亿|T|B)',
+     r'(?<!回购)(?<!回购总)(?<!回购的)市值(?![^\d\n]{0,20}(?:蒸发|缩水|损失|增|减|变|、))[^\d\n]{0,20}\$?\s*' + _NUM + r'\s*(万亿|亿|T|B)(?!\s*股)',
      False, 0.02),
     # 净现金：排除"剔除/扣除净现金后"的算式行
     ('净现金',
@@ -540,6 +541,10 @@ def collect_key_facts(files: list, fields=None) -> dict:
             for name, pat, is_range, _tol in fields:
                 matches = list(re.finditer(pat, line))
                 if name == '市值':
+                    def _inside_paren(m):
+                        gap = line[m.start():m.start(1)]
+                        return ('(' in gap or '（' in gap) and not (')' in gap or '）' in gap)
+                    matches = [m for m in matches if not _inside_paren(m)]
                     # "回购 X 亿股按现价计市值 …" 不是公司市值：看匹配点前 14 字
                     matches = [m for m in matches
                                if not re.search(r'回购|按现价|持仓|浮盈', line[max(0, m.start() - 14):m.start()])]
@@ -610,6 +615,274 @@ def render_consistency(facts: dict, fields=None) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# 双算复核：关键派生指标必须由两个角色各算一次
+#
+# 背景：跨文件一致性（consistency）只能发现"两份报告数字不同"，
+# 发现不了"一份报告自己算错了"。实测中曾出现优先股稀释率算错 20 倍
+# （漏除存托股 1/20），consistency 与 lint 均无法察觉，只有换一个角色
+# 独立重算才暴露。因此关键派生指标（核心EPS、PE、稀释率、CAGR、IRR…）
+# 必须在至少两份报告的「双算复核表」中各出现一次，由本命令比对。
+#
+# 报告中的表格格式（标题含"双算"二字即可被识别）：
+#   ## 双算复核表
+#   | 指标 | 本报告值 | 算式 / 工具 |
+#   |---|---|---|
+#   | 核心TTM EPS | 10.11 | financial_rigor calc '138.28/12.23' |
+# ---------------------------------------------------------------------------
+
+_DUAL_HEADING_RE = re.compile(r'^#{1,6}\s*.*双算.*$')
+_DUAL_SKIP_LABEL = {'指标', '项目', '名称', '口径'}
+
+
+def _norm_metric(s: str) -> str:
+    """指标名归一：去 markdown 记号与空白，全角括号转半角，便于跨文件匹配。"""
+    s = re.sub(r'[\*_`~\s]+', '', s)
+    return s.replace('（', '(').replace('）', ')')
+
+
+def _split_metric(label: str):
+    """把「核心EPS(口径A)」拆成 (基名 '核心EPS', 口径 '口径A')——
+    不同角色给同一指标加的括号说明常不一样，分组只看基名。"""
+    m = re.match(r'^(.*?)\s*\((.*?)\)\s*$', label)
+    if m:
+        return m.group(1), m.group(2)
+    return label, ''
+
+
+def _tables_under(path, heading_re):
+    """扫描文件中所有"标题命中 heading_re"之后紧邻的 Markdown 表格，逐行 yield (行号, 单元格列表)。"""
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            lines = f.read().split('\n')
+    except OSError:
+        return
+    i = 0
+    while i < len(lines):
+        if not heading_re.match(lines[i].strip()):
+            i += 1
+            continue
+        j = i + 1
+        while j < len(lines) and not lines[j].strip().startswith('|'):
+            if lines[j].strip().startswith('#'):
+                break
+            j += 1
+        while j < len(lines) and lines[j].strip().startswith('|'):
+            cells = [c.strip() for c in lines[j].strip().strip('|').split('|')]
+            j += 1
+            if len(cells) >= 2 and not re.fullmatch(r'[\s\-:]+', cells[1]):
+                yield j, cells
+        i = j
+
+
+def collect_dual_calc(files: list) -> dict:
+    """抽取各文件「双算复核表」，返回 {指标: [{file, line, value, unit, formula}]}。"""
+    out = {}
+    for path in files:
+        for j, cells in _tables_under(path, _DUAL_HEADING_RE):
+                label = _norm_metric(cells[0])
+                if not label or label in _DUAL_SKIP_LABEL:
+                    continue
+                label, qualifier = _split_metric(label)
+                m = re.search(r'(' + _SIGN + r'[\d,，]+(?:\.\d+)?)\s*(万亿|亿|[BMT]|%|[xX]|倍)?', cells[1])
+                if not m:
+                    continue
+                val = _clean_num(m.group(1))
+                if val is None:
+                    continue
+                out.setdefault(label, []).append({
+                    'file': os.path.basename(path), 'line': j,
+                    'value': val, 'unit': (m.group(2) or '').lower().replace('倍', 'x'),
+                    'qualifier': qualifier,
+                    'formula': cells[2] if len(cells) > 2 else '',
+                })
+    return out
+
+
+def render_crosscheck(dual: dict, required=None, tol: float = 0.01) -> dict:
+    BOLD, RED, GREEN, YELLOW, RESET = '\033[1m', '\033[91m', '\033[92m', '\033[93m', '\033[0m'
+    print('=' * 70)
+    print(f'{BOLD}双算复核 — 关键派生指标是否被两个角色各算一次{RESET}')
+    print('=' * 70)
+
+    if not dual:
+        print(f'  {YELLOW}未找到任何「双算复核表」{RESET}——各视角报告里应有标题含"双算"二字的表格：')
+        print('       | 指标 | 本报告值 | 算式 / 工具 |')
+        print('  关键派生指标只被算一次时，算错了没有任何检查能发现（实测曾错 20 倍仍全检查通过）。')
+        print('-' * 70)
+        if required:
+            print(f'{BOLD}{RED}【打回】要求双算的 {len(required)} 个指标一个都没有：{"、".join(required)}{RESET}')
+        else:
+            print(f'{BOLD}{YELLOW}【未执行】没有可比对的双算数据。{RESET}')
+        print('=' * 70)
+        return {'agreed': [], 'mismatch': [], 'single': [], 'missing': list(required or [])}
+
+    mismatch, single, agreed, qual_diff = [], [], [], []
+    for metric, hits in sorted(dual.items()):
+        files = {h['file'] for h in hits}
+        vals = [h['value'] for h in hits]
+        units = {h['unit'] for h in hits}
+        if len(files) < 2:
+            single.append((metric, hits))
+            continue
+        lo, hi = min(vals), max(vals)
+        spread = abs(hi - lo) / abs(lo) if lo else (0.0 if hi == 0 else float('inf'))
+        quals = {h.get('qualifier', '') for h in hits}
+        if len(units) > 1 or spread > tol:
+            if len(quals) > 1 and spread > tol:
+                # 值不同、但各方标注的口径也不同 → 是口径分歧不是算错，提示统一口径
+                print(f'  {YELLOW}≠{RESET} {metric:<22s} 口径不同（{" / ".join(q or "未标口径" for q in sorted(quals))}），不判不一致——汇总时并列并注明')
+                for h in sorted(hits, key=lambda x: (x['file'], x['line'])):
+                    print(f'       {h["file"]}:{h["line"]:<4d} {h["value"]}{h["unit"]:<4s} [{h.get("qualifier") or "—"}] | {h["formula"][:44]}')
+                qual_diff.append({'metric': metric, 'hits': hits})
+                continue
+            reason = '单位不一致' if len(units) > 1 else f'偏差 {spread * 100:.1f}% > {tol * 100:.0f}%'
+            print(f'  {RED}✗{RESET} {metric:<22s} {reason}')
+            for h in sorted(hits, key=lambda x: (x['file'], x['line'])):
+                print(f'       {h["file"]}:{h["line"]:<4d} {h["value"]}{h["unit"]:<4s} | {h["formula"][:56]}')
+            mismatch.append({'metric': metric, 'spread_pct': round(spread * 100, 2), 'hits': hits})
+        else:
+            print(f'  {GREEN}✓{RESET} {metric:<22s} {hits[0]["value"]}{hits[0]["unit"]}  （{len(files)} 个角色独立算出，一致）')
+            agreed.append(metric)
+
+    missing = []
+    if required:
+        have = {m for m, h in dual.items() if len({x['file'] for x in h}) >= 2}
+        for req in required:
+            key = _norm_metric(req)
+            if not any(key in m or m in key for m in have):
+                missing.append(req)
+
+    if single:
+        print()
+        print(f'  {YELLOW}只有一个角色算过（未构成双算）：{RESET}')
+        for metric, hits in single:
+            print(f'       {metric}  =  {hits[0]["value"]}{hits[0]["unit"]}   （仅 {hits[0]["file"]}）')
+
+    print('-' * 70)
+    print(f'  双算一致: {GREEN}{len(agreed)}{RESET}  |  不一致: {RED}{len(mismatch)}{RESET}  '
+          f'|  口径不同: {YELLOW}{len(qual_diff)}{RESET}  |  仅单算: {YELLOW}{len(single)}{RESET}  '
+          f'|  必算项缺失: {RED}{len(missing)}{RESET}')
+    if missing:
+        print(f'  {RED}以下必算指标没有被两个角色各算一次：{RESET}{"、".join(missing)}')
+    if mismatch or missing:
+        print(f'{BOLD}{RED}【打回】派生指标的双算未通过——先确认谁算错了，再汇总。{RESET}')
+    else:
+        print(f'{BOLD}{GREEN}【通过】双算指标全部一致。{RESET}')
+    print('=' * 70)
+    return {'agreed': agreed, 'mismatch': mismatch, 'qualifier_diff': [q['metric'] for q in qual_diff],
+            'single': [m for m, _ in single], 'missing': missing}
+
+
+# ---------------------------------------------------------------------------
+# 证据台账：把各视角的「底稿抽查表」汇总成一份可审计的账
+#
+# 单一事实源（共享底稿）的代价是：底稿错了，四份报告会同时继承。
+# 解药是每个 Agent 抽查自己领域内的底稿条目、回查一手原文。本命令把这些
+# 抽查结果收拢成台账，回答三个问题：
+#   1. 底稿哪些条目被独立核过（可从 ⚠️ 升为 ✅，且留下了文件名/日期/核验人）
+#   2. 哪些被证伪（必须回写底稿，否则下一轮继续错）
+#   3. 哪些查了但核不到（保持 ⚠️，不得当作确定事实引用）
+# ---------------------------------------------------------------------------
+
+_EVIDENCE_HEADING_RE = re.compile(r'^#{1,6}\s*.*抽查.*$')
+_VERDICT_RE = re.compile(r'(证实|证伪|核不到|无法核实|未能核实|不成立|成立|不属实|属实|有误|核实为真|为真|不符|矛盾|吻合|确认|相符|两值都对|都对|核实)')
+_EVID_SKIP_LABEL = {'底稿条目', '条目', '项目', '数据项'}
+
+
+def collect_evidence(files: list) -> list:
+    """抽取各文件「底稿抽查表」。列序按 skill 模板：条目 | 原值 | 一手来源 | 核验日期 | 结论。"""
+    rows = []
+    for path in files:
+        for line, cells in _tables_under(path, _EVIDENCE_HEADING_RE):
+            item = re.sub(r'[\*_`~]+', '', cells[0]).strip()
+            if not item or item in _EVID_SKIP_LABEL:
+                continue
+            joined = ' '.join(cells)
+            m = _VERDICT_RE.search(joined)
+            verdict = m.group(1) if m else '未标注'
+            verdict = {'无法核实': '核不到', '未能核实': '核不到',
+                       '成立': '证实', '属实': '证实', '核实为真': '证实', '为真': '证实',
+                       '吻合': '证实', '确认': '证实', '相符': '证实', '两值都对': '证实', '都对': '证实', '核实': '证实',
+                       '不成立': '证伪', '不属实': '证伪', '有误': '证伪', '不符': '证伪', '矛盾': '证伪'}.get(verdict, verdict)
+            # 核验日期优先取「核验日期」列（模板第 4 列）；来源列里往往含文件自身的日期，
+            # 直接扫全行会把"SEC FWP 2026-06-02"误当成核验日期。
+            _DATE = r'20\d{2}[-/]\d{1,2}[-/]\d{1,2}'
+            date = ''
+            dm = re.search(_DATE, cells[3]) if len(cells) > 3 else None
+            if dm is None:
+                tail = ' '.join(cells[3:]) if len(cells) > 3 else ''
+                dm = re.search(_DATE, tail) or (re.search(_DATE, joined) if len(cells) <= 3 else None)
+            if dm:
+                date = dm.group(0).replace('/', '-')
+            # 既无结论也无核验日期的行不是抽查行（多半是标题含"抽查"的段落下顺带贴的数据表），不入账
+            if verdict == '未标注' and not date:
+                continue
+            rows.append({
+                'file': os.path.basename(path), 'line': line, 'item': item,
+                'old_value': cells[1] if len(cells) > 1 else '',
+                'source': cells[2] if len(cells) > 2 else '',
+                'date': date, 'verdict': verdict,
+                'raw': cells,
+            })
+    return rows
+
+
+def render_evidence(rows: list, out_path: str = None, company: str = '') -> dict:
+    BOLD, RED, GREEN, YELLOW, RESET = '\033[1m', '\033[91m', '\033[92m', '\033[93m', '\033[0m'
+    print('=' * 70)
+    print(f'{BOLD}证据台账 — 底稿抽查汇总{RESET}')
+    print('=' * 70)
+    if not rows:
+        print(f'  {YELLOW}未找到任何「底稿抽查表」{RESET}——每份视角报告应有标题含"抽查"二字的表格：')
+        print('       | 底稿条目 | 原值 | 一手来源（文件名/URL） | 核验日期 | 结论 |')
+        print('  没有抽查，底稿的错会被四份报告同时继承且永远发现不了。')
+        print('=' * 70)
+        return {'rows': [], 'confirmed': 0, 'refuted': 0, 'unverifiable': 0, 'incomplete': []}
+
+    buckets = {'证实': [], '证伪': [], '核不到': [], '未标注': []}
+    for r in rows:
+        buckets[r['verdict']].append(r)
+    incomplete = [r for r in rows if r['verdict'] == '证实' and (not r['source'] or not r['date'])]
+
+    for v, mark, color in (('证伪', '✗', RED), ('核不到', '○', YELLOW),
+                           ('证实', '✓', GREEN), ('未标注', '?', YELLOW)):
+        if not buckets[v]:
+            continue
+        print(f'  {color}{mark} {v}（{len(buckets[v])} 条）{RESET}')
+        for r in buckets[v]:
+            print(f'       {r["file"]}:{r["line"]:<4d} {r["item"][:26]:<26s} {r["source"][:34]}')
+    print('-' * 70)
+    print(f'  抽查 {len(rows)} 条  |  证实 {GREEN}{len(buckets["证实"])}{RESET}  '
+          f'|  证伪 {RED}{len(buckets["证伪"])}{RESET}  |  核不到 {YELLOW}{len(buckets["核不到"])}{RESET}')
+    if buckets['证伪']:
+        print(f'  {RED}证伪项必须回写底稿并订正引用它的报告，否则下一轮继续错。{RESET}')
+    if incomplete:
+        print(f'  {YELLOW}{len(incomplete)} 条标"证实"但缺一手来源或核验日期 → 按规则不得升为 ✅。{RESET}')
+
+    if out_path:
+        lines = [f'# {company or ""} 证据台账'.strip(), '',
+                 f'> 由 `tools/report_audit.py evidence` 汇总自各视角报告的「底稿抽查表」，'
+                 f'生成于 {date_mod.today().isoformat()}。',
+                 '> 用途：底稿条目 ⚠️→✅ 的升级凭据（须同时有一手来源与核验日期）；证伪项须回写底稿。', '',
+                 '| 结论 | 底稿条目 | 原值 | 一手来源 | 核验日期 | 出处 |', '|---|---|---|---|---|---|']
+        for v in ('证伪', '核不到', '证实', '未标注'):
+            for r in buckets[v]:
+                lines.append(f'| {v} | {r["item"]} | {r["old_value"]} | {r["source"]} | '
+                             f'{r["date"] or "—"} | {r["file"]}:{r["line"]} |')
+        lines += ['', f'**合计**：抽查 {len(rows)} 条 — 证实 {len(buckets["证实"])}、'
+                      f'证伪 {len(buckets["证伪"])}、核不到 {len(buckets["核不到"])}、'
+                      f'未标注 {len(buckets["未标注"])}。']
+        if incomplete:
+            lines.append(f'**{len(incomplete)} 条标"证实"但凭据不全**（缺一手来源或核验日期），按规则保持 ⚠️。')
+        with open(out_path, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(lines) + '\n')
+        print(f'  台账已写入 {out_path}')
+    print('=' * 70)
+    return {'rows': rows, 'confirmed': len(buckets['证实']), 'refuted': len(buckets['证伪']),
+            'unverifiable': len(buckets['核不到']), 'incomplete': incomplete}
+
+
+# ---------------------------------------------------------------------------
 # Lint：格式与纪律检查（对应 CLAUDE.md 的报告规范）
 # ---------------------------------------------------------------------------
 
@@ -627,6 +900,32 @@ _LINT_RULES = [
     ('UNIT-SLIP', 'WARN', '同一行两个"亿"数值呈 10× / 100× 关系，疑似单位错位',
      lambda l: _unit_slip(l)),
 ]
+
+
+_DERIVED_RE = re.compile(
+    r'稀释(?:率|约|了|比例)|稀释\s*[\d.]|核心\s*EPS|核心\s*PE|CAGR|IRR|隐含增速|'
+    r'隐含.{0,6}增长|反向折现|FCF\s*(?:利润率|收益率)|EV/EBIT|内在价值|安全边际倍数')
+_TOOL_RE = re.compile(r'financial_rigor|terminal_value|usstock_data|twstock_data|ashare_data')
+# 论文/摘要类文件本身不做计算，只承接研究报告的结论——引用了来源报告即视为有证据链
+_CITES_SOURCE_RE = re.compile(r'最终报告|数据底稿|/investment-team|/investment-research|0[1-4]-.{0,20}视角')
+
+
+def _file_level_lint(text: str) -> list:
+    """整文件级规则：派生指标必须留下工具验算痕迹。
+
+    consistency 查跨文件冲突、逐行 lint 查格式，二者都发现不了"自己算错了"。
+    本规则要求凡出现多类派生指标的报告，全文至少有一处工具调用/验算记录。
+    """
+    items = []
+    kinds = len({m.group(0) for m in _DERIVED_RE.finditer(text)})
+    if kinds >= 2 and not _TOOL_RE.search(text) and not _CITES_SOURCE_RE.search(text):
+        items.append({
+            'code': 'DERIVED-NO-CALC', 'level': 'WARN', 'line': 0,
+            'desc': f'出现 {kinds} 类派生指标（稀释率/核心EPS/CAGR/IRR 等），但全文无工具验算痕迹——'
+                    f'派生指标须用 tools/ 下的工具计算并保留算式，禁止心算',
+            'raw': '',
+        })
+    return items
 
 
 def _unit_slip(line: str) -> bool:
@@ -669,6 +968,9 @@ def lint_files(files: list) -> dict:
                     item = {'file': os.path.basename(path), 'line': lineno, 'code': code,
                             'desc': desc, 'raw': line.strip()[:90]}
                     (fails if level == 'FAIL' else warns).append(item)
+        for fl in _file_level_lint('\n'.join(lines)):
+            fl['file'] = os.path.basename(path)
+            (fails if fl['level'] == 'FAIL' else warns).append(fl)
     for it in fails:
         print(f'  {RED}❌ {it["code"]:<16s}{RESET} {it["file"]}:{it["line"]}  {it["desc"]}')
         print(f'       {it["raw"]}')
@@ -734,7 +1036,15 @@ def main():
   多份底稿一致性检查（team-lead 汇总前必跑；指引/股价/股本/市值/净现金…跨文件对照）：
     python3 tools/report_audit.py consistency --dir reports/腾讯
 
-  格式与纪律 lint（半星评分 / 主观表述 / 无日期指引 / 疑似单位错位）：
+  双算复核（关键派生指标必须两个角色各算一次；只查数字一致查不出"自己算错"）：
+    python3 tools/report_audit.py crosscheck --dir reports/腾讯 \
+      --require '核心EPS,核心PE,稀释率,FCF利润率,隐含增速'
+
+  证据台账（汇总各视角的底稿抽查，作为 ⚠️→✅ 的升级凭据）：
+    python3 tools/report_audit.py evidence --dir reports/腾讯 \
+      --company 腾讯 --out reports/腾讯/00-证据台账.md
+
+  格式与纪律 lint（半星 / 主观表述 / 无日期指引 / 单位错位 / 派生指标无算式）：
     python3 tools/report_audit.py lint reports/腾讯/0*.md
         """)
 
@@ -759,8 +1069,24 @@ def main():
     con.add_argument('files', nargs='*', help='或直接列出文件')
     con.add_argument('--output-json', action='store_true')
 
+    # crosscheck
+    cc = sub.add_parser('crosscheck', help='双算复核：关键派生指标是否被两个角色各算一次')
+    cc.add_argument('--dir', help='目录：检查其中所有 0*.md / 最终报告.md')
+    cc.add_argument('files', nargs='*', help='或直接列出文件')
+    cc.add_argument('--require', default='', help='必算指标，逗号分隔（缺一即打回）')
+    cc.add_argument('--tolerance', type=float, default=0.01, help='容差，默认 1%%')
+    cc.add_argument('--output-json', action='store_true')
+
+    # evidence
+    ev = sub.add_parser('evidence', help='证据台账：汇总各视角的底稿抽查结果')
+    ev.add_argument('--dir', help='目录：扫描其中所有 0*.md / 最终报告.md')
+    ev.add_argument('files', nargs='*', help='或直接列出文件')
+    ev.add_argument('--out', help='台账写入路径，如 reports/{公司}/00-证据台账.md')
+    ev.add_argument('--company', default='', help='公司名（写进台账标题）')
+    ev.add_argument('--output-json', action='store_true')
+
     # lint
-    lnt = sub.add_parser('lint', help='格式与纪律 lint（半星/主观表述/无日期指引/单位错位）')
+    lnt = sub.add_parser('lint', help='格式与纪律 lint（半星/主观表述/无日期指引/单位错位/派生指标无算式）')
     lnt.add_argument('files', nargs='+', help='报告文件（可多个）')
     lnt.add_argument('--output-json', action='store_true')
 
@@ -783,6 +1109,42 @@ def main():
         if args.output_json:
             print(json.dumps(outcome, ensure_ascii=False, indent=2))
         sys.exit(1 if outcome['conflicts'] else 0)
+
+    elif args.command == 'crosscheck':
+        files = list(args.files or [])
+        if args.dir:
+            import glob
+            files += sorted(glob.glob(os.path.join(args.dir, '0*.md')))
+            final = os.path.join(args.dir, '最终报告.md')
+            if os.path.exists(final):
+                files.append(final)
+        files = [f for f in files if os.path.exists(f)]
+        if not files:
+            print('❌ 没有可检查的文件', file=sys.stderr)
+            sys.exit(1)
+        req = [x.strip() for x in args.require.split(',') if x.strip()]
+        outcome = render_crosscheck(collect_dual_calc(files), req, args.tolerance)
+        if args.output_json:
+            print(json.dumps(outcome, ensure_ascii=False, indent=2))
+        sys.exit(1 if (outcome['mismatch'] or outcome['missing']) else 0)
+
+    elif args.command == 'evidence':
+        files = list(args.files or [])
+        if args.dir:
+            import glob
+            files += sorted(glob.glob(os.path.join(args.dir, '0*.md')))
+            final = os.path.join(args.dir, '最终报告.md')
+            if os.path.exists(final):
+                files.append(final)
+        files = [f for f in files if os.path.exists(f) and not f.endswith('证据台账.md')]
+        if not files:
+            print('❌ 没有可检查的文件', file=sys.stderr)
+            sys.exit(1)
+        outcome = render_evidence(collect_evidence(files), args.out, args.company)
+        if args.output_json:
+            print(json.dumps({k: v for k, v in outcome.items() if k != 'rows'},
+                             ensure_ascii=False, indent=2, default=str))
+        sys.exit(1 if outcome['refuted'] else 0)
 
     elif args.command == 'lint':
         outcome = lint_files(args.files)

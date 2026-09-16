@@ -24,6 +24,9 @@ SEC 要求请求带能联系到你的 User-Agent（公司/项目名 + 邮箱）�
     python3 tools/usstock_data.py financials GOOGL     # 近5个财年：营收/经营利润/净利润/OCF/Capex/FCF/EPS/ROE
     python3 tools/usstock_data.py quarterly GOOGL      # 近8个季度（Q4 由年度−前三季推算）
     python3 tools/usstock_data.py valuation GOOGL      # PE(TTM)/PB/PS/FCF收益率 + 非经营损益占比预警
+    python3 tools/usstock_data.py datasheet GOOGL --cik 1652044 --price 349.39 \
+        --as-of 2026-09-14 --out reports/Google/00-数据底稿.json   # 机器可读底稿
+    python3 tools/usstock_data.py datasheet --check reports/Google/00-数据底稿.json  # 新鲜度体检
     任何子命令加 --json 输出机器可读 JSON（供数据底稿直接引用）
 
 注意：
@@ -52,7 +55,10 @@ _BROWSER_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.3
 _UA_HINT = ('SEC 要求声明式 User-Agent（"名称 邮箱"）。设置方法任选其一：\n'
             '    export SEC_USER_AGENT="Your Name you@example.com"\n'
             '    echo "Your Name you@example.com" > local/sec_user_agent.txt   # local/ 不入库\n'
-            '  未设置时财务数据仍可用（浏览器 UA），但代码表不可用——请用 --cik 直接给 CIK。')
+            '  未设置时财务数据仍可用（浏览器 UA），但代码表不可用——请用 --cik 直接给 CIK。\n'
+            '  CIK 在任何一份 SEC 文件的网址里：sec.gov/Archives/edgar/data/{CIK}/...\n'
+            '  常用：Alphabet 1652044｜Apple 320193｜Microsoft 789019｜Amazon 1018724｜'
+            'Meta 1326801｜NVIDIA 1045810｜Tesla 1318605｜Berkshire 1067983')
 
 _SEC_TICKERS = "https://www.sec.gov/files/company_tickers.json"
 _SEC_FACTS = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik:010d}.json"
@@ -578,6 +584,138 @@ def cmd_valuation(ticker, price=None, shares=None, as_json=False, cik=None):
     print("\n  → 交叉验证：与 stockanalysis.com/stocks/{ticker}/statistics 对照，误差 >1% 须标注")
 
 
+# ---------------------------------------------------------------------------
+# 机器可读底稿：每个字段带 as_of（数据期末）与 fetched_at（实际取数时间）
+#
+# 为什么要 JSON 版：Markdown 底稿人读方便，但机器判断不了"这个数过期没有"。
+# 跨轮复用时（第二轮沿用第一轮底稿）必须能自动回答两件事：
+#   1. 数据取自什么时候（fetched_at）——缓存是否该刷新
+#   2. 数据覆盖到哪一期（as_of）——SEC 上是否已有更新的季报
+# ---------------------------------------------------------------------------
+
+def _cache_mtime_iso(cik):
+    """取数时间 = 缓存文件落盘时间，比"生成 JSON 的时间"更真实。"""
+    try:
+        ts = os.path.getmtime(_cache_path(f"facts_{cik}.json"))
+        return datetime.fromtimestamp(ts).isoformat(timespec="seconds")
+    except OSError:
+        return datetime.now().isoformat(timespec="seconds")
+
+
+def cmd_datasheet(ticker, cik=None, price=None, as_of=None, years=5, n=8, out=None):
+    cik, name = _cik_for(ticker, cik)
+    facts = _load_facts(cik)
+    fetched = _cache_mtime_iso(cik)
+    annual = build_annual(facts, years)
+    quarterly = build_quarterly(facts, n)
+    sh, sh_date, sh_note = shares_outstanding(facts)
+
+    if price is None:
+        try:
+            px = _fetch_price(ticker)
+            price, price_src = px["price"], px["source"]
+            as_of = as_of or (px.get("time", "") or "")[:10]
+        except Exception as e:  # noqa: BLE001
+            price, price_src = None, f"行情不可用（{e}）"
+    else:
+        price_src = "手动锁定（--price）——全队基准价"
+
+    doc = {
+        "schema": "ai-berkshire/datasheet/1",
+        "company": {"ticker": ticker.upper(), "cik": cik, "name": name},
+        "basis": {
+            "price": price, "currency": "USD",
+            "as_of": as_of or date.today().isoformat(),
+            "price_source": price_src,
+            "note": "本价为全队基准价；所有视角报告与工具调用一律传 --price 锁定，禁止各自实时取价",
+        },
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "sections": {
+            "shares": {
+                "value": sh, "as_of": sh_date, "note": sh_note,
+                "source": "SEC XBRL（dei 封面页股数，缺失时退回最新单季稀释加权）",
+                "fetched_at": fetched, "evidence_level": "A-一手",
+            },
+            "annual": {
+                "rows": annual, "as_of": annual[-1]["end"] if annual else None,
+                "source": "SEC XBRL 10-K", "fetched_at": fetched, "evidence_level": "A-一手",
+            },
+            "quarterly": {
+                "rows": quarterly, "as_of": quarterly[-1]["end"] if quarterly else None,
+                "source": "SEC XBRL 10-Q/10-K（Q4 由年度−前三季推算，见 derived_q4）",
+                "fetched_at": fetched, "evidence_level": "A-一手",
+            },
+        },
+        "stale_policy": {
+            "facts_ttl_hours": 24,
+            "rule": "fetched_at 超过 ttl 或 SEC 已有更新期末 → 重跑本命令刷新；"
+                    "分部/指引/监管等非 XBRL 字段不在本文件内，见 Markdown 底稿",
+        },
+    }
+    txt = json.dumps(doc, ensure_ascii=False, indent=2)
+    if out:
+        with open(out, "w", encoding="utf-8") as f:
+            f.write(txt + "\n")
+        print(f"✅ 机器可读底稿已写入 {out}")
+        print(f"   基准价 {price} USD（{doc['basis']['as_of']}，{price_src}）")
+        print(f"   年度覆盖至 {doc['sections']['annual']['as_of']}，季度覆盖至 {doc['sections']['quarterly']['as_of']}")
+        print(f"   取数时间 {fetched}")
+    else:
+        print(txt)
+
+
+def cmd_datasheet_check(path, offline=False):
+    """新鲜度体检：取数多久了、覆盖到哪一期、SEC 上是否已有更新的季报。"""
+    try:
+        with open(path, encoding="utf-8") as f:
+            doc = json.load(f)
+    except OSError as e:
+        raise RuntimeError(f"读不到底稿：{e}") from e
+    if doc.get("schema") != "ai-berkshire/datasheet/1":
+        raise RuntimeError(f"不是本工具产出的底稿（schema={doc.get('schema')!r}）")
+
+    print("=" * 66)
+    print(f"底稿新鲜度体检 — {doc['company']['ticker']}（CIK {doc['company']['cik']:010d}）")
+    print("=" * 66)
+    print(f"  基准价 {doc['basis']['price']} {doc['basis']['currency']}   基准日 {doc['basis']['as_of']}")
+    ttl = doc.get("stale_policy", {}).get("facts_ttl_hours", 24)
+    stale = []
+    now = datetime.now()
+    for key, sec in doc["sections"].items():
+        fetched = sec.get("fetched_at", "")
+        try:
+            age_h = (now - datetime.fromisoformat(fetched)).total_seconds() / 3600
+        except ValueError:
+            age_h = float("inf")
+        flag = "过期" if age_h > ttl else "新鲜"
+        if age_h > ttl:
+            stale.append(key)
+        print(f"  {key:<10s} 覆盖至 {str(sec.get('as_of')):<12s} 取数于 {fetched[:16]:<17s} "
+              f"（{age_h:.0f} 小时前，{flag}）")
+
+    newer = None
+    if not offline:
+        try:
+            facts = _load_facts(doc["company"]["cik"])
+            q = build_quarterly(facts, 8)
+            latest = q[-1]["end"] if q else None
+            have = doc["sections"]["quarterly"]["as_of"]
+            if latest and have and latest > have:
+                newer = latest
+        except Exception as e:  # noqa: BLE001
+            print(f"  ⚠️ 无法联网核对最新期末（{e}）")
+
+    print("-" * 66)
+    if newer:
+        print(f"  ❌ SEC 已有更新季度（{newer} > 底稿的 {doc['sections']['quarterly']['as_of']}）→ 必须重跑 datasheet")
+    elif stale:
+        print(f"  ⚠️ {len(stale)} 个区块的缓存已超过 {ttl} 小时（{'、'.join(stale)}），期末未变，可继续用；如需最新价请重跑")
+    else:
+        print("  ✅ 底稿新鲜，可直接复用（跨轮研究无需重新取数）")
+    print("=" * 66)
+    return 1 if newer else 0
+
+
 def main():
     parser = argparse.ArgumentParser(description="美股数据工具（SEC EDGAR XBRL + Yahoo 行情）")
     sub = parser.add_subparsers(dest="command")
@@ -596,6 +734,17 @@ def main():
             p.add_argument("--years", type=int, default=5)
         if cmd == "quarterly":
             p.add_argument("--n", type=int, default=8)
+    ds = sub.add_parser("datasheet", help="产出机器可读底稿 JSON（带 as_of / fetched_at）")
+    ds.add_argument("ticker", nargs="?", help="代码；与 --check 二选一")
+    ds.add_argument("--cik", type=int, help="直接给 CIK，跳过代码表")
+    ds.add_argument("--price", type=float, help="锁定全队基准价（强烈建议传）")
+    ds.add_argument("--as-of", dest="as_of", help="基准日 YYYY-MM-DD")
+    ds.add_argument("--years", type=int, default=5)
+    ds.add_argument("--n", type=int, default=8)
+    ds.add_argument("--out", help="写入路径，如 reports/{公司}/00-数据底稿.json")
+    ds.add_argument("--check", help="体检已有底稿的新鲜度（覆盖期末 / 取数时间 / SEC 是否已更新）")
+    ds.add_argument("--offline", action="store_true", help="体检时不联网核对最新期末")
+
     p_search = sub.add_parser("search", help="搜索 ticker / 公司名")
     p_search.add_argument("keyword")
     p_search.add_argument("--json", action="store_true")
@@ -605,7 +754,15 @@ def main():
         parser.print_help()
         return
     try:
-        if args.command == "search":
+        if args.command == "datasheet":
+            if args.check:
+                sys.exit(cmd_datasheet_check(args.check, args.offline))
+            if not args.ticker:
+                print("❌ 需要 ticker，或用 --check 体检已有底稿", file=sys.stderr)
+                sys.exit(2)
+            cmd_datasheet(args.ticker, args.cik, args.price, args.as_of,
+                          args.years, args.n, args.out)
+        elif args.command == "search":
             cmd_search(args.keyword, args.json)
         elif args.command == "quote":
             cmd_quote(args.ticker, args.price, args.shares, args.json, args.cik)
